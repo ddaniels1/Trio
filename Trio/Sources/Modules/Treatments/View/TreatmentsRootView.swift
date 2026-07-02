@@ -2,9 +2,9 @@ import Charts
 import CoreData
 import LoopKitUI
 import Observation
-import PhotosUI
 import SwiftUI
 import Swinject
+import UIKit
 
 extension Treatments {
     struct RootView: BaseView {
@@ -22,7 +22,8 @@ extension Treatments {
         @State var state = StateModel()
 
         @State private var showPresetSheet = false
-        @State private var showAIMealEstimatorSheet = false
+        @State private var showAIMealCamera = false
+        @State private var aiMealEstimatorViewModel = AIMealEstimatorViewModel()
         @State private var autofocus: Bool = true
         @State private var calculatorDetent = PresentationDetent.large
         @State private var pushed: Bool = false
@@ -162,11 +163,56 @@ extension Treatments {
 
         private var aiMealEstimatorButton: some View {
             Button {
-                showAIMealEstimatorSheet = true
+                aiMealEstimatorViewModel.loadAPIKey()
+                aiMealEstimatorViewModel.errorMessage = nil
+                showAIMealCamera = true
             } label: {
-                Label("Estimate Carbs from Photo", systemImage: "camera.viewfinder")
+                if aiMealEstimatorViewModel.isEstimating {
+                    HStack {
+                        ProgressView()
+                        Text("Estimating carbs...")
+                    }
+                } else {
+                    Label("Estimate Carbs from Photo", systemImage: "camera.viewfinder")
+                }
             }
             .buttonStyle(.borderless)
+            .disabled(aiMealEstimatorViewModel.isEstimating || !UIImagePickerController.isSourceTypeAvailable(.camera))
+        }
+
+        @ViewBuilder private var aiMealEstimatorResult: some View {
+            if let carbEstimate = aiMealEstimatorViewModel.carbEstimate {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("AI photo estimate")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+
+                    Text("Food: \(carbEstimate.foodType)")
+                    Text("Size: \(carbEstimate.portionSize)")
+                    Text("Carbs: \(carbEstimate.carbsGrams) g")
+                        .fontWeight(.semibold)
+
+                    if !carbEstimate.summary.isEmpty {
+                        Text(carbEstimate.summary)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .font(.footnote)
+            }
+
+            if let errorMessage = aiMealEstimatorViewModel.errorMessage {
+                Text(errorMessage)
+                    .font(.footnote)
+                    .foregroundStyle(.red)
+            }
+        }
+
+        private func estimateCarbsFromCapturedMeal(_ image: UIImage) async {
+            aiMealEstimatorViewModel.setSelectedImage(image)
+            await aiMealEstimatorViewModel.estimateCarbs()
+
+            guard let carbEstimate = aiMealEstimatorViewModel.carbEstimate else { return }
+            state.carbs = Decimal(carbEstimate.carbsGrams)
         }
 
         /// Determines the next field to focus on based on the current focused field.
@@ -226,6 +272,7 @@ extension Treatments {
                         Section {
                             carbsTextField()
                             aiMealEstimatorButton
+                            aiMealEstimatorResult
 
                             if state.useFPUconversion {
                                 proteinAndFat()
@@ -460,8 +507,12 @@ extension Treatments {
             }) {
                 MealPresetView(state: state)
             }
-            .sheet(isPresented: $showAIMealEstimatorSheet) {
-                AIMealEstimatorView()
+            .sheet(isPresented: $showAIMealCamera) {
+                AIMealCameraPicker { image in
+                    Task {
+                        await estimateCarbsFromCapturedMeal(image)
+                    }
+                }
             }
             .alert("Error while processing Treatment", isPresented: $state.showDeterminationFailureAlert) {
                 Button("OK", role: .cancel) {
@@ -738,136 +789,17 @@ extension Treatments {
     }
 }
 
-struct AIMealEstimatorView: View {
-    @Environment(\.dismiss) private var dismiss
-
-    @State private var viewModel = AIMealEstimatorViewModel()
-    @State private var showCamera = false
-
-    var body: some View {
-        @Bindable var viewModel = viewModel
-
-        NavigationStack {
-            VStack(alignment: .leading, spacing: 16) {
-                Group {
-                    if let selectedImage = viewModel.selectedImage {
-                        Image(uiImage: selectedImage)
-                            .resizable()
-                            .scaledToFit()
-                    } else {
-                        ContentUnavailableView(
-                            "No Photo Selected",
-                            systemImage: "photo",
-                            description: Text("Choose or capture a meal photo to prepare it for carb estimation.")
-                        )
-                    }
-                }
-                .frame(maxWidth: .infinity)
-                .frame(height: 260)
-                .clipShape(RoundedRectangle(cornerRadius: 8))
-
-                HStack(spacing: 12) {
-                    PhotosPicker(selection: $viewModel.selectedPhotoItem, matching: .images) {
-                        Label("Choose Photo", systemImage: "photo.on.rectangle")
-                    }
-                    .buttonStyle(.bordered)
-
-                    Button {
-                        showCamera = true
-                    } label: {
-                        Label("Take Photo", systemImage: "camera")
-                    }
-                    .buttonStyle(.bordered)
-                    .disabled(!UIImagePickerController.isSourceTypeAvailable(.camera))
-                }
-
-                Text("Selected photos are sent to OpenAI only when you request an estimate.")
-                    .foregroundStyle(.secondary)
-
-                SecureField("OpenAI API Key", text: $viewModel.apiKey)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-
-                Button {
-                    Task {
-                        await viewModel.estimateCarbs()
-                    }
-                } label: {
-                    if viewModel.isEstimating {
-                        ProgressView()
-                    } else {
-                        Label("Estimate Carbs", systemImage: "sparkles")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .disabled(!viewModel.canEstimate)
-
-                if let carbEstimate = viewModel.carbEstimate {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Estimated carbs: \(carbEstimate.carbsGrams) g")
-                            .font(.headline)
-
-                        Text(carbEstimate.summary)
-                            .foregroundStyle(.secondary)
-
-                        if !carbEstimate.foods.isEmpty {
-                            Text(carbEstimate.foods.joined(separator: ", "))
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                }
-
-                if let errorMessage = viewModel.errorMessage {
-                    Text(errorMessage)
-                        .foregroundStyle(.red)
-                }
-
-                Spacer()
-            }
-            .padding()
-            .navigationTitle("Estimate Carbs")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
-                        dismiss()
-                    }
-                }
-
-                ToolbarItem(placement: .confirmationAction) {
-                    Button("Use Estimate") {}
-                        .disabled(true)
-                }
-            }
-            .onChange(of: viewModel.selectedPhotoItem) {
-                Task {
-                    await viewModel.loadSelectedPhoto()
-                }
-            }
-            .onAppear {
-                viewModel.loadAPIKey()
-            }
-            .sheet(isPresented: $showCamera) {
-                AIMealCameraPicker { image in
-                    viewModel.setSelectedImage(image)
-                }
-            }
-        }
-    }
-}
-
 @Observable
 @MainActor final class AIMealEstimatorViewModel {
     private enum Config {
         static let openAIAPIKeyKey = "AIMealEstimator.openAIAPIKey"
+        static let hardcodedOpenAIAPIKey = ""
     }
 
     private let keychain: Keychain = BaseKeychain()
     private let estimatorClient = OpenAIMealEstimatorClient()
 
     var selectedImage: UIImage?
-    var selectedPhotoItem: PhotosPickerItem?
     var apiKey = ""
     var carbEstimate: AIMealCarbEstimate?
     var isEstimating = false
@@ -878,32 +810,14 @@ struct AIMealEstimatorView: View {
     }
 
     func loadAPIKey() {
-        apiKey = keychain.getValue(String.self, forKey: Config.openAIAPIKeyKey) ?? ""
+        let hardcodedAPIKey = Config.hardcodedOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        apiKey = hardcodedAPIKey.isEmpty ? keychain.getValue(String.self, forKey: Config.openAIAPIKeyKey) ?? "" : hardcodedAPIKey
     }
 
     func setSelectedImage(_ image: UIImage) {
         selectedImage = image
-        selectedPhotoItem = nil
         carbEstimate = nil
         errorMessage = nil
-    }
-
-    func loadSelectedPhoto() async {
-        guard let selectedPhotoItem else { return }
-
-        do {
-            guard let imageData = try await selectedPhotoItem.loadTransferable(type: Data.self),
-                  let image = UIImage(data: imageData)
-            else {
-                return
-            }
-
-            selectedImage = image
-            carbEstimate = nil
-            errorMessage = nil
-        } catch {
-            debug(.default, "Unable to load selected meal photo: \(error.localizedDescription)")
-        }
     }
 
     func estimateCarbs() async {
@@ -915,7 +829,14 @@ struct AIMealEstimatorView: View {
 
         do {
             let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-            keychain.setValue(trimmedAPIKey, forKey: Config.openAIAPIKeyKey)
+            guard !trimmedAPIKey.isEmpty else {
+                throw OpenAIMealEstimatorClient.ClientError.missingAPIKey
+            }
+
+            if Config.hardcodedOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                keychain.setValue(trimmedAPIKey, forKey: Config.openAIAPIKeyKey)
+            }
+
             carbEstimate = try await estimatorClient.estimateCarbs(from: selectedImage, apiKey: trimmedAPIKey)
         } catch {
             errorMessage = error.localizedDescription
@@ -926,25 +847,30 @@ struct AIMealEstimatorView: View {
 }
 
 struct AIMealCarbEstimate: Decodable {
+    let foodType: String
+    let portionSize: String
     let carbsGrams: Int
     let summary: String
-    let foods: [String]
 
     enum CodingKeys: String, CodingKey {
+        case foodType = "food_type"
+        case portionSize = "portion_size"
         case carbsGrams = "carbs_grams"
         case summary
-        case foods
     }
 }
 
 struct OpenAIMealEstimatorClient {
     enum ClientError: LocalizedError {
+        case missingAPIKey
         case invalidImage
         case invalidResponse
         case requestFailed(String)
 
         var errorDescription: String? {
             switch self {
+            case .missingAPIKey:
+                return "Add an OpenAI API key before estimating carbs from a photo."
             case .invalidImage:
                 return "Unable to prepare the selected image."
             case .invalidResponse:
@@ -1000,7 +926,7 @@ struct OpenAIMealEstimatorClient {
                         [
                             "type": "input_text",
                             "text": """
-                            Estimate the total carbohydrates in this meal photo. Return only minified JSON with keys carbs_grams, summary, and foods. carbs_grams must be an integer. Include a conservative visual estimate and do not include medical dosing advice.
+                            Estimate the visible meal in this photo. Return only minified JSON with keys food_type, portion_size, carbs_grams, and summary. food_type must be a short plain-language description of the food. portion_size must describe the visually estimated serving size. carbs_grams must be an integer total carbohydrate estimate. summary must be one sentence. Include a conservative visual estimate and do not include medical dosing advice.
                             """
                         ],
                         [
@@ -1012,7 +938,7 @@ struct OpenAIMealEstimatorClient {
                 ]
             ],
             "temperature": 0.1,
-            "max_output_tokens": 300
+            "max_output_tokens": 350
         ]
     }
 
