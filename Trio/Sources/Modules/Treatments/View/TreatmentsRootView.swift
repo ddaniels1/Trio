@@ -1,6 +1,8 @@
 import Charts
 import CoreData
 import LoopKitUI
+import Observation
+import PhotosUI
 import SwiftUI
 import Swinject
 
@@ -20,6 +22,7 @@ extension Treatments {
         @State var state = StateModel()
 
         @State private var showPresetSheet = false
+        @State private var showAIMealEstimatorSheet = false
         @State private var autofocus: Bool = true
         @State private var calculatorDetent = PresentationDetent.large
         @State private var pushed: Bool = false
@@ -157,6 +160,15 @@ extension Treatments {
             }
         }
 
+        private var aiMealEstimatorButton: some View {
+            Button {
+                showAIMealEstimatorSheet = true
+            } label: {
+                Label("Estimate Carbs from Photo", systemImage: "camera.viewfinder")
+            }
+            .buttonStyle(.borderless)
+        }
+
         /// Determines the next field to focus on based on the current focused field.
         ///
         /// This function handles the tab order navigation between input fields,
@@ -213,6 +225,7 @@ extension Treatments {
 
                         Section {
                             carbsTextField()
+                            aiMealEstimatorButton
 
                             if state.useFPUconversion {
                                 proteinAndFat()
@@ -446,6 +459,9 @@ extension Treatments {
                 showPresetSheet = false
             }) {
                 MealPresetView(state: state)
+            }
+            .sheet(isPresented: $showAIMealEstimatorSheet) {
+                AIMealEstimatorView()
             }
             .alert("Error while processing Treatment", isPresented: $state.showDeterminationFailureAlert) {
                 Button("OK", role: .cancel) {
@@ -718,6 +734,370 @@ extension Treatments {
                 .frame(height: 1)
                 .foregroundColor(.gray.opacity(0.65))
                 .padding(.vertical)
+        }
+    }
+}
+
+struct AIMealEstimatorView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var viewModel = AIMealEstimatorViewModel()
+    @State private var showCamera = false
+
+    var body: some View {
+        @Bindable var viewModel = viewModel
+
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 16) {
+                Group {
+                    if let selectedImage = viewModel.selectedImage {
+                        Image(uiImage: selectedImage)
+                            .resizable()
+                            .scaledToFit()
+                    } else {
+                        ContentUnavailableView(
+                            "No Photo Selected",
+                            systemImage: "photo",
+                            description: Text("Choose or capture a meal photo to prepare it for carb estimation.")
+                        )
+                    }
+                }
+                .frame(maxWidth: .infinity)
+                .frame(height: 260)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+
+                HStack(spacing: 12) {
+                    PhotosPicker(selection: $viewModel.selectedPhotoItem, matching: .images) {
+                        Label("Choose Photo", systemImage: "photo.on.rectangle")
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button {
+                        showCamera = true
+                    } label: {
+                        Label("Take Photo", systemImage: "camera")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!UIImagePickerController.isSourceTypeAvailable(.camera))
+                }
+
+                Text("Selected photos are sent to OpenAI only when you request an estimate.")
+                    .foregroundStyle(.secondary)
+
+                SecureField("OpenAI API Key", text: $viewModel.apiKey)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+
+                Button {
+                    Task {
+                        await viewModel.estimateCarbs()
+                    }
+                } label: {
+                    if viewModel.isEstimating {
+                        ProgressView()
+                    } else {
+                        Label("Estimate Carbs", systemImage: "sparkles")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!viewModel.canEstimate)
+
+                if let carbEstimate = viewModel.carbEstimate {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Estimated carbs: \(carbEstimate.carbsGrams) g")
+                            .font(.headline)
+
+                        Text(carbEstimate.summary)
+                            .foregroundStyle(.secondary)
+
+                        if !carbEstimate.foods.isEmpty {
+                            Text(carbEstimate.foods.joined(separator: ", "))
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+
+                if let errorMessage = viewModel.errorMessage {
+                    Text(errorMessage)
+                        .foregroundStyle(.red)
+                }
+
+                Spacer()
+            }
+            .padding()
+            .navigationTitle("Estimate Carbs")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Use Estimate") {}
+                        .disabled(true)
+                }
+            }
+            .onChange(of: viewModel.selectedPhotoItem) {
+                Task {
+                    await viewModel.loadSelectedPhoto()
+                }
+            }
+            .onAppear {
+                viewModel.loadAPIKey()
+            }
+            .sheet(isPresented: $showCamera) {
+                AIMealCameraPicker { image in
+                    viewModel.setSelectedImage(image)
+                }
+            }
+        }
+    }
+}
+
+@Observable
+@MainActor final class AIMealEstimatorViewModel {
+    private enum Config {
+        static let openAIAPIKeyKey = "AIMealEstimator.openAIAPIKey"
+    }
+
+    private let keychain: Keychain = BaseKeychain()
+    private let estimatorClient = OpenAIMealEstimatorClient()
+
+    var selectedImage: UIImage?
+    var selectedPhotoItem: PhotosPickerItem?
+    var apiKey = ""
+    var carbEstimate: AIMealCarbEstimate?
+    var isEstimating = false
+    var errorMessage: String?
+
+    var canEstimate: Bool {
+        selectedImage != nil && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isEstimating
+    }
+
+    func loadAPIKey() {
+        apiKey = keychain.getValue(String.self, forKey: Config.openAIAPIKeyKey) ?? ""
+    }
+
+    func setSelectedImage(_ image: UIImage) {
+        selectedImage = image
+        selectedPhotoItem = nil
+        carbEstimate = nil
+        errorMessage = nil
+    }
+
+    func loadSelectedPhoto() async {
+        guard let selectedPhotoItem else { return }
+
+        do {
+            guard let imageData = try await selectedPhotoItem.loadTransferable(type: Data.self),
+                  let image = UIImage(data: imageData)
+            else {
+                return
+            }
+
+            selectedImage = image
+            carbEstimate = nil
+            errorMessage = nil
+        } catch {
+            debug(.default, "Unable to load selected meal photo: \(error.localizedDescription)")
+        }
+    }
+
+    func estimateCarbs() async {
+        guard let selectedImage else { return }
+
+        isEstimating = true
+        errorMessage = nil
+        carbEstimate = nil
+
+        do {
+            let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            keychain.setValue(trimmedAPIKey, forKey: Config.openAIAPIKeyKey)
+            carbEstimate = try await estimatorClient.estimateCarbs(from: selectedImage, apiKey: trimmedAPIKey)
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        isEstimating = false
+    }
+}
+
+struct AIMealCarbEstimate: Decodable {
+    let carbsGrams: Int
+    let summary: String
+    let foods: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case carbsGrams = "carbs_grams"
+        case summary
+        case foods
+    }
+}
+
+struct OpenAIMealEstimatorClient {
+    enum ClientError: LocalizedError {
+        case invalidImage
+        case invalidResponse
+        case requestFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidImage:
+                return "Unable to prepare the selected image."
+            case .invalidResponse:
+                return "OpenAI did not return a carb estimate."
+            case let .requestFailed(message):
+                return message
+            }
+        }
+    }
+
+    private let endpoint = URL(string: "https://api.openai.com/v1/responses")!
+    private let model = "gpt-4.1-mini"
+
+    func estimateCarbs(from image: UIImage, apiKey: String) async throws -> AIMealCarbEstimate {
+        guard let imageData = image.jpegData(compressionQuality: 0.72) else {
+            throw ClientError.invalidImage
+        }
+
+        let base64Image = imageData.base64EncodedString()
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody(base64Image: base64Image))
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ClientError.invalidResponse
+        }
+
+        guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            throw ClientError
+                .requestFailed(Self.errorMessage(from: data) ?? "OpenAI request failed with status \(httpResponse.statusCode).")
+        }
+
+        let responseBody = try JSONDecoder().decode(OpenAIResponsesBody.self, from: data)
+        guard let outputText = responseBody.outputText,
+              let estimateData = outputText.data(using: .utf8)
+        else {
+            throw ClientError.invalidResponse
+        }
+
+        return try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
+    }
+
+    private func requestBody(base64Image: String) -> [String: Any] {
+        [
+            "model": model,
+            "input": [
+                [
+                    "role": "user",
+                    "content": [
+                        [
+                            "type": "input_text",
+                            "text": """
+                            Estimate the total carbohydrates in this meal photo. Return only minified JSON with keys carbs_grams, summary, and foods. carbs_grams must be an integer. Include a conservative visual estimate and do not include medical dosing advice.
+                            """
+                        ],
+                        [
+                            "type": "input_image",
+                            "image_url": "data:image/jpeg;base64,\(base64Image)",
+                            "detail": "low"
+                        ]
+                    ]
+                ]
+            ],
+            "temperature": 0.1,
+            "max_output_tokens": 300
+        ]
+    }
+
+    private static func errorMessage(from data: Data) -> String? {
+        guard let body = try? JSONDecoder().decode(OpenAIErrorBody.self, from: data) else {
+            return nil
+        }
+
+        return body.error.message
+    }
+}
+
+private struct OpenAIResponsesBody: Decodable {
+    struct Output: Decodable {
+        struct Content: Decodable {
+            let type: String
+            let text: String?
+        }
+
+        let content: [Content]?
+    }
+
+    let output: [Output]
+
+    var outputText: String? {
+        for outputItem in output {
+            guard let content = outputItem.content else { continue }
+
+            for item in content where item.type == "output_text" || item.type == "text" {
+                return item.text
+            }
+        }
+
+        return nil
+    }
+}
+
+private struct OpenAIErrorBody: Decodable {
+    struct APIError: Decodable {
+        let message: String
+    }
+
+    let error: APIError
+}
+
+struct AIMealCameraPicker: UIViewControllerRepresentable {
+    let onImageSelected: (UIImage) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    func makeUIViewController(context: Context) -> UIImagePickerController {
+        let picker = UIImagePickerController()
+        picker.sourceType = .camera
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_: UIImagePickerController, context _: Context) {}
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onImageSelected: onImageSelected, dismiss: dismiss)
+    }
+
+    final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
+        private let onImageSelected: (UIImage) -> Void
+        private let dismiss: DismissAction
+
+        init(onImageSelected: @escaping (UIImage) -> Void, dismiss: DismissAction) {
+            self.onImageSelected = onImageSelected
+            self.dismiss = dismiss
+        }
+
+        func imagePickerController(
+            _: UIImagePickerController,
+            didFinishPickingMediaWithInfo info: [UIImagePickerController.InfoKey: Any]
+        ) {
+            if let image = info[.originalImage] as? UIImage {
+                onImageSelected(image)
+            }
+
+            dismiss()
+        }
+
+        func imagePickerControllerDidCancel(_: UIImagePickerController) {
+            dismiss()
         }
     }
 }
