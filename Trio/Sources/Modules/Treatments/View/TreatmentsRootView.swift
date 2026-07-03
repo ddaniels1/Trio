@@ -23,6 +23,7 @@ extension Treatments {
 
         @State private var showPresetSheet = false
         @State private var showAIMealCamera = false
+        @State private var showAIMealPhotoLibrary = false
         @State private var showHandCalibration = false
         @State private var aiMealEstimatorViewModel = AIMealEstimatorViewModel()
         @State private var autofocus: Bool = true
@@ -207,13 +208,25 @@ extension Treatments {
                         .font(.subheadline)
                         .fontWeight(.semibold)
 
-                    Text("Food: \(carbEstimate.foodItem)")
-                    Text("Size: \(carbEstimate.estimatedSize)")
-                    Text("Weight: \(carbEstimate.estimatedWeightGrams) g")
-                    Text("Carbs: \(carbEstimate.carbsGrams) g")
+                    Text("Reference: \(carbEstimate.referenceDetected ? carbEstimate.referenceDescription : "Not detected")")
+                    Text("Total carbs: \(carbEstimate.totalCarbsGrams) g")
                         .fontWeight(.semibold)
+                    Text(
+                        "Carb range: \(carbEstimate.confidenceIntervalGrams.lowerBound)-\(carbEstimate.confidenceIntervalGrams.upperBound) g"
+                    )
                     Text("Confidence: \(carbEstimate.confidence)")
-                    Text("High fat: \(carbEstimate.highFat ? "Yes" : "No")")
+
+                    ForEach(carbEstimate.foodItems) { foodItem in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(foodItem.name)
+                                .fontWeight(.semibold)
+                            Text("Dimensions: \(foodItem.estimatedDimensions)")
+                            Text("Weight: \(foodItem.estimatedWeightGrams) g")
+                            Text("Carbs: \(foodItem.carbsGrams) g")
+                            Text("High fat: \(foodItem.highFat ? "Yes" : "No")")
+                        }
+                        .padding(.top, 4)
+                    }
 
                     if !carbEstimate.explanation.isEmpty {
                         Text(carbEstimate.explanation)
@@ -235,7 +248,7 @@ extension Treatments {
             await aiMealEstimatorViewModel.estimateCarbs()
 
             guard let carbEstimate = aiMealEstimatorViewModel.carbEstimate else { return }
-            state.carbs = Decimal(carbEstimate.carbsGrams)
+            state.carbs = Decimal(carbEstimate.totalCarbsGrams)
         }
 
         /// Determines the next field to focus on based on the current focused field.
@@ -532,7 +545,19 @@ extension Treatments {
                 MealPresetView(state: state)
             }
             .sheet(isPresented: $showAIMealCamera) {
-                AIMealCameraPicker { image in
+                AIMealCameraPicker(onPhotoLibraryRequested: {
+                    showAIMealCamera = false
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        showAIMealPhotoLibrary = true
+                    }
+                }) { image in
+                    Task {
+                        await estimateCarbsFromCapturedMeal(image)
+                    }
+                }
+            }
+            .sheet(isPresented: $showAIMealPhotoLibrary) {
+                AIMealCameraPicker(sourceType: .photoLibrary) { image in
                     Task {
                         await estimateCarbsFromCapturedMeal(image)
                     }
@@ -1055,21 +1080,51 @@ struct HandCalibrationEstimate: Decodable {
 }
 
 struct AIMealCarbEstimate: Decodable {
-    let foodItem: String
-    let estimatedSize: String
-    let estimatedWeightGrams: Int
-    let carbsGrams: Int
+    struct FoodItem: Decodable, Identifiable {
+        let name: String
+        let estimatedDimensions: String
+        let estimatedWeightGrams: Int
+        let carbsGrams: Int
+        let highFat: Bool
+
+        var id: String {
+            "\(name)-\(estimatedDimensions)-\(estimatedWeightGrams)-\(carbsGrams)"
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case name
+            case estimatedDimensions = "estimated_dimensions"
+            case estimatedWeightGrams = "estimated_weight_grams"
+            case carbsGrams = "carbs_grams"
+            case highFat = "high_fat"
+        }
+    }
+
+    struct ConfidenceIntervalGrams: Decodable {
+        let lowerBound: Int
+        let upperBound: Int
+
+        enum CodingKeys: String, CodingKey {
+            case lowerBound = "lower_bound"
+            case upperBound = "upper_bound"
+        }
+    }
+
+    let referenceDetected: Bool
+    let referenceDescription: String
+    let foodItems: [FoodItem]
+    let totalCarbsGrams: Int
+    let confidenceIntervalGrams: ConfidenceIntervalGrams
     let confidence: String
-    let highFat: Bool
     let explanation: String
 
     enum CodingKeys: String, CodingKey {
-        case foodItem = "food_item"
-        case estimatedSize = "estimated_size"
-        case estimatedWeightGrams = "estimated_weight_grams"
-        case carbsGrams = "carbs_grams"
+        case referenceDetected = "reference_detected"
+        case referenceDescription = "reference_description"
+        case foodItems = "food_items"
+        case totalCarbsGrams = "total_carbs_grams"
+        case confidenceIntervalGrams = "confidence_interval_grams"
         case confidence
-        case highFat = "high_fat"
         case explanation
     }
 }
@@ -1096,10 +1151,10 @@ struct OpenAIMealEstimatorClient {
     }
 
     private let endpoint = URL(string: "https://api.openai.com/v1/responses")!
-    private let model = "gpt-4.1-mini"
+    private let model = "gpt-5"
 
     func estimateCarbs(from image: UIImage, calibration: HandCalibration?, apiKey: String) async throws -> AIMealCarbEstimate {
-        guard let imageData = image.jpegData(compressionQuality: 0.72) else {
+        guard let imageData = image.jpegData(compressionQuality: 0.93) else {
             throw ClientError.invalidImage
         }
 
@@ -1114,7 +1169,9 @@ struct OpenAIMealEstimatorClient {
                 prompt: mealPrompt(calibration: calibration),
                 schemaName: "meal_carb_estimate",
                 responseSchema: mealResponseSchema,
-                maxOutputTokens: 350
+                imageDetail: "high",
+                reasoningEffort: "low",
+                maxOutputTokens: 2000
             )
         )
 
@@ -1132,10 +1189,14 @@ struct OpenAIMealEstimatorClient {
         guard let outputText = responseBody.outputText,
               let estimateData = outputText.data(using: .utf8)
         else {
-            throw ClientError.invalidResponse
+            throw ClientError.requestFailed(responseBody.failureMessage ?? ClientError.invalidResponse.localizedDescription)
         }
 
-        return try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
+        do {
+            return try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
+        } catch {
+            throw ClientError.requestFailed("OpenAI returned an estimate, but it did not match the expected carb JSON format.")
+        }
     }
 
     func estimatePalmWidth(from image: UIImage, apiKey: String) async throws -> HandCalibrationEstimate {
@@ -1154,6 +1215,8 @@ struct OpenAIMealEstimatorClient {
                 prompt: palmCalibrationPrompt,
                 schemaName: "hand_palm_width_calibration",
                 responseSchema: palmCalibrationResponseSchema,
+                imageDetail: "low",
+                reasoningEffort: nil,
                 maxOutputTokens: 220
             )
         )
@@ -1172,10 +1235,15 @@ struct OpenAIMealEstimatorClient {
         guard let outputText = responseBody.outputText,
               let estimateData = outputText.data(using: .utf8)
         else {
-            throw ClientError.invalidResponse
+            throw ClientError.requestFailed(responseBody.failureMessage ?? ClientError.invalidResponse.localizedDescription)
         }
 
-        return try JSONDecoder().decode(HandCalibrationEstimate.self, from: estimateData)
+        do {
+            return try JSONDecoder().decode(HandCalibrationEstimate.self, from: estimateData)
+        } catch {
+            throw ClientError
+                .requestFailed("OpenAI returned a calibration result, but it did not match the expected JSON format.")
+        }
     }
 
     private func requestBody(
@@ -1183,9 +1251,11 @@ struct OpenAIMealEstimatorClient {
         prompt: String,
         schemaName: String,
         responseSchema: [String: Any],
+        imageDetail: String,
+        reasoningEffort: String?,
         maxOutputTokens: Int
     ) -> [String: Any] {
-        [
+        var body: [String: Any] = [
             "model": model,
             "input": [
                 [
@@ -1198,7 +1268,7 @@ struct OpenAIMealEstimatorClient {
                         [
                             "type": "input_image",
                             "image_url": "data:image/jpeg;base64,\(base64Image)",
-                            "detail": "low"
+                            "detail": imageDetail
                         ]
                     ]
                 ]
@@ -1211,9 +1281,16 @@ struct OpenAIMealEstimatorClient {
                     "schema": responseSchema
                 ]
             ],
-            "temperature": 0.1,
             "max_output_tokens": maxOutputTokens
         ]
+
+        if let reasoningEffort {
+            body["reasoning"] = [
+                "effort": reasoningEffort
+            ]
+        }
+
+        return body
     }
 
     private func mealPrompt(calibration: HandCalibration?) -> String {
@@ -1231,7 +1308,11 @@ struct OpenAIMealEstimatorClient {
 
         return """
         Estimate carbohydrates from the visible meal photo for user confirmation only. Do not provide insulin dosing advice. \(calibrationText)
-        Return structured JSON only. If no hand is visible in the meal photo, set confidence to low and include a user-facing explanation suggesting retaking the photo with their hand visible for scale.
+        Return strict structured JSON only. First identify every visible food item. Do not collapse distinct foods into one item unless they are visually inseparable.
+        Detect whether any usable scale reference is visible, including the user's hand based on previous credit-card calibration. Set reference_detected to true only when a visible reference can be used for scale, and describe it in reference_description.
+        For every item, estimate physical dimensions before weight. Then estimate weight. Then estimate carbs for that item.
+        Sum the per-item carbs into total_carbs_grams. Include a required confidence_interval_grams lower_bound and upper_bound for total carbs.
+        If no usable hand or scale reference is visible, set reference_detected to false, confidence to low, use a wider confidence interval, and explain that retaking the photo with their hand visible will improve the estimate.
         Estimate each value conservatively from the image. high_fat should be true when the visible meal appears likely high in fat.
         """
     }
@@ -1247,30 +1328,77 @@ struct OpenAIMealEstimatorClient {
             "type": "object",
             "additionalProperties": false,
             "properties": [
-                "food_item": [
+                "reference_detected": [
+                    "type": "boolean",
+                    "description": "Whether a usable visual scale reference, preferably the user's hand, is visible in the photo."
+                ],
+                "reference_description": [
                     "type": "string",
-                    "description": "Short user-facing description of the primary visible food or meal."
+                    "description": "Description of the detected scale reference, or a short note that no usable reference was detected."
                 ],
-                "estimated_size": [
-                    "type": "string",
-                    "description": "Visual portion size estimate, using the calibrated hand as scale when visible."
+                "food_items": [
+                    "type": "array",
+                    "description": "Every visible food item with dimensions, weight, carbs, and high-fat flag.",
+                    "items": [
+                        "type": "object",
+                        "additionalProperties": false,
+                        "properties": [
+                            "name": [
+                                "type": "string",
+                                "description": "Short user-facing name of this visible food item."
+                            ],
+                            "estimated_dimensions": [
+                                "type": "string",
+                                "description": "Estimated physical dimensions or portion size of this item."
+                            ],
+                            "estimated_weight_grams": [
+                                "type": "integer",
+                                "description": "Estimated weight of this item in grams."
+                            ],
+                            "carbs_grams": [
+                                "type": "integer",
+                                "description": "Estimated carbohydrates for this item in grams."
+                            ],
+                            "high_fat": [
+                                "type": "boolean",
+                                "description": "Whether this item appears high in fat."
+                            ]
+                        ],
+                        "required": [
+                            "name",
+                            "estimated_dimensions",
+                            "estimated_weight_grams",
+                            "carbs_grams",
+                            "high_fat"
+                        ]
+                    ]
                 ],
-                "estimated_weight_grams": [
+                "total_carbs_grams": [
                     "type": "integer",
-                    "description": "Estimated total food weight in grams."
+                    "description": "Sum of carbs_grams across every food item."
                 ],
-                "carbs_grams": [
-                    "type": "integer",
-                    "description": "Estimated total carbohydrates in grams."
+                "confidence_interval_grams": [
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": [
+                        "lower_bound": [
+                            "type": "integer",
+                            "description": "Lower bound of the estimated total carbohydrates in grams."
+                        ],
+                        "upper_bound": [
+                            "type": "integer",
+                            "description": "Upper bound of the estimated total carbohydrates in grams."
+                        ]
+                    ],
+                    "required": [
+                        "lower_bound",
+                        "upper_bound"
+                    ]
                 ],
                 "confidence": [
                     "type": "string",
                     "enum": ["low", "medium", "high"],
                     "description": "Confidence in the carb estimate."
-                ],
-                "high_fat": [
-                    "type": "boolean",
-                    "description": "Whether the meal appears high in fat."
                 ],
                 "explanation": [
                     "type": "string",
@@ -1278,12 +1406,12 @@ struct OpenAIMealEstimatorClient {
                 ]
             ],
             "required": [
-                "food_item",
-                "estimated_size",
-                "estimated_weight_grams",
-                "carbs_grams",
+                "reference_detected",
+                "reference_description",
+                "food_items",
+                "total_carbs_grams",
+                "confidence_interval_grams",
                 "confidence",
-                "high_fat",
                 "explanation"
             ]
         ]
@@ -1326,6 +1454,10 @@ struct OpenAIMealEstimatorClient {
 }
 
 private struct OpenAIResponsesBody: Decodable {
+    struct IncompleteDetails: Decodable {
+        let reason: String?
+    }
+
     struct Output: Decodable {
         struct Content: Decodable {
             let type: String
@@ -1335,7 +1467,22 @@ private struct OpenAIResponsesBody: Decodable {
         let content: [Content]?
     }
 
+    let status: String?
+    let incompleteDetails: IncompleteDetails?
     let output: [Output]
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case incompleteDetails = "incomplete_details"
+        case output
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decodeIfPresent(String.self, forKey: .status)
+        incompleteDetails = try container.decodeIfPresent(IncompleteDetails.self, forKey: .incompleteDetails)
+        output = try container.decodeIfPresent([Output].self, forKey: .output) ?? []
+    }
 
     var outputText: String? {
         for outputItem in output {
@@ -1344,6 +1491,21 @@ private struct OpenAIResponsesBody: Decodable {
             for item in content where item.type == "output_text" || item.type == "text" {
                 return item.text
             }
+        }
+
+        return nil
+    }
+
+    var failureMessage: String? {
+        if status == "incomplete" {
+            if let reason = incompleteDetails?.reason {
+                return "OpenAI response was incomplete: \(reason)."
+            }
+            return "OpenAI response was incomplete."
+        }
+
+        if let status, status != "completed" {
+            return "OpenAI response status was \(status)."
         }
 
         return nil
@@ -1358,31 +1520,101 @@ private struct OpenAIErrorBody: Decodable {
     let error: APIError
 }
 
+private final class AIMealCameraOverlayView: UIView {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hitView = super.hitTest(point, with: event)
+        return hitView === self ? nil : hitView
+    }
+}
+
 struct AIMealCameraPicker: UIViewControllerRepresentable {
+    let sourceType: UIImagePickerController.SourceType
+    let onPhotoLibraryRequested: (() -> Void)?
     let onImageSelected: (UIImage) -> Void
 
     @Environment(\.dismiss) private var dismiss
 
+    init(
+        sourceType: UIImagePickerController.SourceType = .camera,
+        onPhotoLibraryRequested: (() -> Void)? = nil,
+        onImageSelected: @escaping (UIImage) -> Void
+    ) {
+        self.sourceType = sourceType
+        self.onPhotoLibraryRequested = onPhotoLibraryRequested
+        self.onImageSelected = onImageSelected
+    }
+
     func makeUIViewController(context: Context) -> UIImagePickerController {
         let picker = UIImagePickerController()
-        picker.sourceType = .camera
+        picker.sourceType = sourceType
         picker.delegate = context.coordinator
+
+        if sourceType == .camera, onPhotoLibraryRequested != nil {
+            picker.showsCameraControls = true
+            picker.cameraOverlayView = context.coordinator.makePhotoLibraryOverlay()
+        }
+
         return picker
     }
 
     func updateUIViewController(_: UIImagePickerController, context _: Context) {}
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(onImageSelected: onImageSelected, dismiss: dismiss)
+        Coordinator(
+            onImageSelected: onImageSelected,
+            onPhotoLibraryRequested: onPhotoLibraryRequested,
+            dismiss: dismiss
+        )
     }
 
     final class Coordinator: NSObject, UINavigationControllerDelegate, UIImagePickerControllerDelegate {
         private let onImageSelected: (UIImage) -> Void
+        private let onPhotoLibraryRequested: (() -> Void)?
         private let dismiss: DismissAction
 
-        init(onImageSelected: @escaping (UIImage) -> Void, dismiss: DismissAction) {
+        init(
+            onImageSelected: @escaping (UIImage) -> Void,
+            onPhotoLibraryRequested: (() -> Void)?,
+            dismiss: DismissAction
+        ) {
             self.onImageSelected = onImageSelected
+            self.onPhotoLibraryRequested = onPhotoLibraryRequested
             self.dismiss = dismiss
+        }
+
+        func makePhotoLibraryOverlay() -> UIView {
+            let overlay = AIMealCameraOverlayView(frame: UIScreen.main.bounds)
+            overlay.backgroundColor = .clear
+            overlay.isUserInteractionEnabled = true
+
+            let button = UIButton(type: .system)
+            var configuration = UIButton.Configuration.filled()
+            configuration.title = String(localized: "Photo Library")
+            configuration.image = UIImage(systemName: "photo.on.rectangle")
+            configuration.imagePadding = 6
+            configuration.baseForegroundColor = .white
+            configuration.baseBackgroundColor = UIColor.black.withAlphaComponent(0.55)
+            configuration.contentInsets = NSDirectionalEdgeInsets(top: 10, leading: 12, bottom: 10, trailing: 12)
+            button.configuration = configuration
+            button.tintColor = .white
+            button.layer.cornerRadius = 8
+            button.layer.shadowColor = UIColor.black.cgColor
+            button.layer.shadowOpacity = 0.35
+            button.layer.shadowRadius = 6
+            button.layer.shadowOffset = CGSize(width: 0, height: 2)
+            button.addTarget(self, action: #selector(openPhotoLibrary), for: .touchUpInside)
+            button.frame = CGRect(x: 16, y: 52, width: 180, height: 48)
+            button.autoresizingMask = [.flexibleRightMargin, .flexibleBottomMargin]
+            overlay.addSubview(button)
+
+            return overlay
+        }
+
+        @objc private func openPhotoLibrary() {
+            dismiss()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [onPhotoLibraryRequested] in
+                onPhotoLibraryRequested?()
+            }
         }
 
         func imagePickerController(
