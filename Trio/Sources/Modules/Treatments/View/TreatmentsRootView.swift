@@ -23,6 +23,7 @@ extension Treatments {
 
         @State private var showPresetSheet = false
         @State private var showAIMealCamera = false
+        @State private var showHandCalibration = false
         @State private var aiMealEstimatorViewModel = AIMealEstimatorViewModel()
         @State private var autofocus: Bool = true
         @State private var calculatorDetent = PresentationDetent.large
@@ -165,7 +166,11 @@ extension Treatments {
             Button {
                 aiMealEstimatorViewModel.loadAPIKey()
                 aiMealEstimatorViewModel.errorMessage = nil
-                showAIMealCamera = true
+                if aiMealEstimatorViewModel.handCalibration == nil {
+                    showHandCalibration = true
+                } else {
+                    showAIMealCamera = true
+                }
             } label: {
                 if aiMealEstimatorViewModel.isEstimating {
                     HStack {
@@ -180,6 +185,21 @@ extension Treatments {
             .disabled(aiMealEstimatorViewModel.isEstimating || !UIImagePickerController.isSourceTypeAvailable(.camera))
         }
 
+        private var handCalibrationButton: some View {
+            Button {
+                aiMealEstimatorViewModel.loadAPIKey()
+                aiMealEstimatorViewModel.errorMessage = nil
+                showHandCalibration = true
+            } label: {
+                if let handCalibration = aiMealEstimatorViewModel.handCalibration {
+                    Label("Hand scale: \(handCalibration.palmWidthCm, specifier: "%.1f") cm", systemImage: "hand.raised")
+                } else {
+                    Label("Calibrate Hand Scale", systemImage: "hand.raised")
+                }
+            }
+            .buttonStyle(.borderless)
+        }
+
         @ViewBuilder private var aiMealEstimatorResult: some View {
             if let carbEstimate = aiMealEstimatorViewModel.carbEstimate {
                 VStack(alignment: .leading, spacing: 6) {
@@ -187,13 +207,16 @@ extension Treatments {
                         .font(.subheadline)
                         .fontWeight(.semibold)
 
-                    Text("Food: \(carbEstimate.foodType)")
-                    Text("Size: \(carbEstimate.portionSize)")
+                    Text("Food: \(carbEstimate.foodItem)")
+                    Text("Size: \(carbEstimate.estimatedSize)")
+                    Text("Weight: \(carbEstimate.estimatedWeightGrams) g")
                     Text("Carbs: \(carbEstimate.carbsGrams) g")
                         .fontWeight(.semibold)
+                    Text("Confidence: \(carbEstimate.confidence)")
+                    Text("High fat: \(carbEstimate.highFat ? "Yes" : "No")")
 
-                    if !carbEstimate.summary.isEmpty {
-                        Text(carbEstimate.summary)
+                    if !carbEstimate.explanation.isEmpty {
+                        Text(carbEstimate.explanation)
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -272,6 +295,7 @@ extension Treatments {
                         Section {
                             carbsTextField()
                             aiMealEstimatorButton
+                            handCalibrationButton
                             aiMealEstimatorResult
 
                             if state.useFPUconversion {
@@ -512,6 +536,16 @@ extension Treatments {
                     Task {
                         await estimateCarbsFromCapturedMeal(image)
                     }
+                }
+            }
+            .sheet(isPresented: $showHandCalibration) {
+                HandCalibrationView(
+                    existingCalibration: aiMealEstimatorViewModel.handCalibration,
+                    apiKey: aiMealEstimatorViewModel.apiKey
+                ) { calibration in
+                    aiMealEstimatorViewModel.saveHandCalibration(calibration)
+                    showHandCalibration = false
+                    showAIMealCamera = true
                 }
             }
             .alert("Error while processing Treatment", isPresented: $state.showDeterminationFailureAlert) {
@@ -802,6 +836,7 @@ extension Treatments {
     var selectedImage: UIImage?
     var apiKey = ""
     var carbEstimate: AIMealCarbEstimate?
+    var handCalibration = HandCalibrationStore.load()
     var isEstimating = false
     var errorMessage: String?
 
@@ -818,6 +853,11 @@ extension Treatments {
         selectedImage = image
         carbEstimate = nil
         errorMessage = nil
+    }
+
+    func saveHandCalibration(_ calibration: HandCalibration) {
+        HandCalibrationStore.save(calibration)
+        handCalibration = calibration
     }
 
     func estimateCarbs() async {
@@ -837,7 +877,11 @@ extension Treatments {
                 keychain.setValue(trimmedAPIKey, forKey: Config.openAIAPIKeyKey)
             }
 
-            carbEstimate = try await estimatorClient.estimateCarbs(from: selectedImage, apiKey: trimmedAPIKey)
+            carbEstimate = try await estimatorClient.estimateCarbs(
+                from: selectedImage,
+                calibration: handCalibration,
+                apiKey: trimmedAPIKey
+            )
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -846,17 +890,187 @@ extension Treatments {
     }
 }
 
-struct AIMealCarbEstimate: Decodable {
-    let foodType: String
-    let portionSize: String
-    let carbsGrams: Int
-    let summary: String
+struct HandCalibration: Codable {
+    let palmWidthCm: Double
+    let calibratedAt: Date
+    let calibratedWithCreditCard: Bool
+}
+
+enum HandCalibrationStore {
+    private static let key = "AIMealEstimator.handCalibration"
+
+    static func load() -> HandCalibration? {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(HandCalibration.self, from: data)
+    }
+
+    static func save(_ calibration: HandCalibration) {
+        guard let data = try? JSONEncoder().encode(calibration) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+struct HandCalibrationView: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var palmWidthText = ""
+    @State private var showCamera = false
+    @State private var capturedReferenceImage: UIImage?
+    @State private var isEstimating = false
+    @State private var confidence = ""
+    @State private var explanation = ""
+    @State private var errorMessage: String?
+
+    let existingCalibration: HandCalibration?
+    let apiKey: String
+    let onSave: (HandCalibration) -> Void
+
+    private let estimatorClient = OpenAIMealEstimatorClient()
+
+    private var palmWidthCm: Double? {
+        let normalizedText = palmWidthText.replacingOccurrences(of: ",", with: ".")
+        guard let value = Double(normalizedText), value > 0 else { return nil }
+        return value
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    if existingCalibration == nil {
+                        Button {
+                            showCamera = true
+                        } label: {
+                            Label("Capture Hand with Credit Card", systemImage: "camera")
+                        }
+                        .disabled(isEstimating || !UIImagePickerController.isSourceTypeAvailable(.camera))
+                    }
+
+                    if let capturedReferenceImage {
+                        Image(uiImage: capturedReferenceImage)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(maxHeight: 180)
+                    }
+
+                    if isEstimating {
+                        HStack {
+                            ProgressView()
+                            Text("Estimating palm width...")
+                        }
+                    }
+
+                    if let palmWidthCm {
+                        Text("Palm width: \(palmWidthCm, specifier: "%.1f") cm")
+                    }
+
+                    if !confidence.isEmpty {
+                        Text("Confidence: \(confidence)")
+                    }
+
+                    if !explanation.isEmpty {
+                        Text(explanation)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let errorMessage {
+                        Text(errorMessage)
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            .navigationTitle("Hand Scale")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        dismiss()
+                    }
+                }
+
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        guard let palmWidthCm else { return }
+                        onSave(
+                            HandCalibration(
+                                palmWidthCm: palmWidthCm,
+                                calibratedAt: Date(),
+                                calibratedWithCreditCard: capturedReferenceImage != nil
+                            )
+                        )
+                    }
+                    .disabled(palmWidthCm == nil || isEstimating)
+                }
+            }
+            .sheet(isPresented: $showCamera) {
+                AIMealCameraPicker { image in
+                    capturedReferenceImage = image
+                    Task {
+                        await estimatePalmWidth(from: image)
+                    }
+                }
+            }
+            .onAppear {
+                if let calibration = existingCalibration ?? HandCalibrationStore.load() {
+                    palmWidthText = String(format: "%.1f", calibration.palmWidthCm)
+                }
+            }
+        }
+    }
+
+    private func estimatePalmWidth(from image: UIImage) async {
+        isEstimating = true
+        errorMessage = nil
+        confidence = ""
+        explanation = ""
+
+        do {
+            let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmedAPIKey.isEmpty else {
+                throw OpenAIMealEstimatorClient.ClientError.missingAPIKey
+            }
+
+            let estimate = try await estimatorClient.estimatePalmWidth(from: image, apiKey: trimmedAPIKey)
+            palmWidthText = String(format: "%.1f", estimate.palmWidthCm)
+            confidence = estimate.confidence
+            explanation = estimate.explanation
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+
+        isEstimating = false
+    }
+}
+
+struct HandCalibrationEstimate: Decodable {
+    let palmWidthCm: Double
+    let confidence: String
+    let explanation: String
 
     enum CodingKeys: String, CodingKey {
-        case foodType = "food_type"
-        case portionSize = "portion_size"
+        case palmWidthCm = "palm_width_cm"
+        case confidence
+        case explanation
+    }
+}
+
+struct AIMealCarbEstimate: Decodable {
+    let foodItem: String
+    let estimatedSize: String
+    let estimatedWeightGrams: Int
+    let carbsGrams: Int
+    let confidence: String
+    let highFat: Bool
+    let explanation: String
+
+    enum CodingKeys: String, CodingKey {
+        case foodItem = "food_item"
+        case estimatedSize = "estimated_size"
+        case estimatedWeightGrams = "estimated_weight_grams"
         case carbsGrams = "carbs_grams"
-        case summary
+        case confidence
+        case highFat = "high_fat"
+        case explanation
     }
 }
 
@@ -884,7 +1098,7 @@ struct OpenAIMealEstimatorClient {
     private let endpoint = URL(string: "https://api.openai.com/v1/responses")!
     private let model = "gpt-4.1-mini"
 
-    func estimateCarbs(from image: UIImage, apiKey: String) async throws -> AIMealCarbEstimate {
+    func estimateCarbs(from image: UIImage, calibration: HandCalibration?, apiKey: String) async throws -> AIMealCarbEstimate {
         guard let imageData = image.jpegData(compressionQuality: 0.72) else {
             throw ClientError.invalidImage
         }
@@ -894,7 +1108,15 @@ struct OpenAIMealEstimatorClient {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
-        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody(base64Image: base64Image))
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: requestBody(
+                base64Image: base64Image,
+                prompt: mealPrompt(calibration: calibration),
+                schemaName: "meal_carb_estimate",
+                responseSchema: mealResponseSchema,
+                maxOutputTokens: 350
+            )
+        )
 
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -916,7 +1138,53 @@ struct OpenAIMealEstimatorClient {
         return try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
     }
 
-    private func requestBody(base64Image: String) -> [String: Any] {
+    func estimatePalmWidth(from image: UIImage, apiKey: String) async throws -> HandCalibrationEstimate {
+        guard let imageData = image.jpegData(compressionQuality: 0.72) else {
+            throw ClientError.invalidImage
+        }
+
+        let base64Image = imageData.base64EncodedString()
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: requestBody(
+                base64Image: base64Image,
+                prompt: palmCalibrationPrompt,
+                schemaName: "hand_palm_width_calibration",
+                responseSchema: palmCalibrationResponseSchema,
+                maxOutputTokens: 220
+            )
+        )
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ClientError.invalidResponse
+        }
+
+        guard (200 ..< 300).contains(httpResponse.statusCode) else {
+            throw ClientError
+                .requestFailed(Self.errorMessage(from: data) ?? "OpenAI request failed with status \(httpResponse.statusCode).")
+        }
+
+        let responseBody = try JSONDecoder().decode(OpenAIResponsesBody.self, from: data)
+        guard let outputText = responseBody.outputText,
+              let estimateData = outputText.data(using: .utf8)
+        else {
+            throw ClientError.invalidResponse
+        }
+
+        return try JSONDecoder().decode(HandCalibrationEstimate.self, from: estimateData)
+    }
+
+    private func requestBody(
+        base64Image: String,
+        prompt: String,
+        schemaName: String,
+        responseSchema: [String: Any],
+        maxOutputTokens: Int
+    ) -> [String: Any] {
         [
             "model": model,
             "input": [
@@ -925,9 +1193,7 @@ struct OpenAIMealEstimatorClient {
                     "content": [
                         [
                             "type": "input_text",
-                            "text": """
-                            Estimate the visible meal in this photo. Return only minified JSON with keys food_type, portion_size, carbs_grams, and summary. food_type must be a short plain-language description of the food. portion_size must describe the visually estimated serving size. carbs_grams must be an integer total carbohydrate estimate. summary must be one sentence. Include a conservative visual estimate and do not include medical dosing advice.
-                            """
+                            "text": prompt
                         ],
                         [
                             "type": "input_image",
@@ -937,8 +1203,116 @@ struct OpenAIMealEstimatorClient {
                     ]
                 ]
             ],
+            "text": [
+                "format": [
+                    "type": "json_schema",
+                    "name": schemaName,
+                    "strict": true,
+                    "schema": responseSchema
+                ]
+            ],
             "temperature": 0.1,
-            "max_output_tokens": 350
+            "max_output_tokens": maxOutputTokens
+        ]
+    }
+
+    private func mealPrompt(calibration: HandCalibration?) -> String {
+        let calibrationText: String
+        if let calibration {
+            calibrationText = """
+            The user has calibrated their hand scale. Their palm width is \(calibration
+                .palmWidthCm) cm. Use any visible hand in the meal photo as a scale reference for estimating food size and weight.
+            """
+        } else {
+            calibrationText = """
+            The user has not calibrated their hand scale. Estimate visually without hand scale calibration and lower confidence if size is uncertain.
+            """
+        }
+
+        return """
+        Estimate carbohydrates from the visible meal photo for user confirmation only. Do not provide insulin dosing advice. \(calibrationText)
+        Return structured JSON only. If no hand is visible in the meal photo, set confidence to low and include a user-facing explanation suggesting retaking the photo with their hand visible for scale.
+        Estimate each value conservatively from the image. high_fat should be true when the visible meal appears likely high in fat.
+        """
+    }
+
+    private var palmCalibrationPrompt: String {
+        """
+        Estimate the user's palm width in centimeters from this calibration photo. Use the visible credit card as the scale reference. A standard credit card is 8.56 cm wide and 5.398 cm tall. Measure palm width across the widest visible part of the palm, excluding the thumb. Return structured JSON only. If either the hand or the credit card is not visible, set confidence to low and explain what needs to be retaken.
+        """
+    }
+
+    private var mealResponseSchema: [String: Any] {
+        [
+            "type": "object",
+            "additionalProperties": false,
+            "properties": [
+                "food_item": [
+                    "type": "string",
+                    "description": "Short user-facing description of the primary visible food or meal."
+                ],
+                "estimated_size": [
+                    "type": "string",
+                    "description": "Visual portion size estimate, using the calibrated hand as scale when visible."
+                ],
+                "estimated_weight_grams": [
+                    "type": "integer",
+                    "description": "Estimated total food weight in grams."
+                ],
+                "carbs_grams": [
+                    "type": "integer",
+                    "description": "Estimated total carbohydrates in grams."
+                ],
+                "confidence": [
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Confidence in the carb estimate."
+                ],
+                "high_fat": [
+                    "type": "boolean",
+                    "description": "Whether the meal appears high in fat."
+                ],
+                "explanation": [
+                    "type": "string",
+                    "description": "Short user-facing explanation, including retake guidance when no hand is visible."
+                ]
+            ],
+            "required": [
+                "food_item",
+                "estimated_size",
+                "estimated_weight_grams",
+                "carbs_grams",
+                "confidence",
+                "high_fat",
+                "explanation"
+            ]
+        ]
+    }
+
+    private var palmCalibrationResponseSchema: [String: Any] {
+        [
+            "type": "object",
+            "additionalProperties": false,
+            "properties": [
+                "palm_width_cm": [
+                    "type": "number",
+                    "description": "Estimated palm width in centimeters, using the credit card dimensions as scale."
+                ],
+                "confidence": [
+                    "type": "string",
+                    "enum": ["low", "medium", "high"],
+                    "description": "Confidence in the palm width estimate."
+                ],
+                "explanation": [
+                    "type": "string",
+                    "description": "Short explanation of the estimate or retake guidance."
+                ]
+            ],
+            "required": [
+                "palm_width_cm",
+                "confidence",
+                "explanation"
+            ]
         ]
     }
 
