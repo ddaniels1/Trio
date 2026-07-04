@@ -302,31 +302,52 @@ extension Treatments {
             if let carbEstimate = aiMealEstimatorViewModel.carbEstimate {
                 VStack(alignment: .leading, spacing: 6) {
                     Text("AI photo estimate")
+                        .aiResultWrapped()
                         .font(.subheadline)
                         .fontWeight(.semibold)
 
                     Text("Reference: \(carbEstimate.referenceDetected ? carbEstimate.referenceDescription : "Not detected")")
+                        .aiResultWrapped()
                     Text("Total carbs: \(carbEstimate.totalCarbsGrams) g")
+                        .aiResultWrapped()
                         .fontWeight(.semibold)
                     Text(
                         "Carb range: \(carbEstimate.confidenceIntervalGrams.lowerBound)-\(carbEstimate.confidenceIntervalGrams.upperBound) g"
                     )
+                    .aiResultWrapped()
                     Text("Confidence: \(carbEstimate.confidence)")
+                        .aiResultWrapped()
 
                     ForEach(carbEstimate.foodItems) { foodItem in
                         VStack(alignment: .leading, spacing: 3) {
                             Text(foodItem.name)
+                                .aiResultWrapped()
                                 .fontWeight(.semibold)
                             Text("Dimensions: \(foodItem.estimatedDimensions)")
+                                .aiResultWrapped()
+                            Text("Volume: \(foodItem.estimatedVolumeMilliliters) mL")
+                                .aiResultWrapped()
                             Text("Weight: \(foodItem.estimatedWeightGrams) g")
+                                .aiResultWrapped()
+                            Text("Carb density: \(foodItem.assumedCarbsPer100Grams, specifier: "%.1f") g/100 g")
+                                .aiResultWrapped()
                             Text("Carbs: \(foodItem.carbsGrams) g")
+                                .aiResultWrapped()
+                            Text("Portion confidence: \(foodItem.portionConfidence)")
+                                .aiResultWrapped()
+                            Text("Density confidence: \(foodItem.carbDensityConfidence)")
+                                .aiResultWrapped()
+                            Text("Calculation: \(foodItem.calculationExplanation)")
+                                .aiResultWrapped()
                             Text("High fat: \(foodItem.highFat ? "Yes" : "No")")
+                                .aiResultWrapped()
                         }
                         .padding(.top, 4)
                     }
 
                     if !carbEstimate.explanation.isEmpty {
                         Text(carbEstimate.explanation)
+                            .aiResultWrapped()
                             .foregroundStyle(.secondary)
                     }
                 }
@@ -335,6 +356,7 @@ extension Treatments {
 
             if let errorMessage = aiMealEstimatorViewModel.errorMessage {
                 Text(errorMessage)
+                    .aiResultWrapped()
                     .font(.footnote)
                     .foregroundStyle(.red)
             }
@@ -1265,19 +1287,29 @@ struct AIMealCarbEstimate: Decodable {
     struct FoodItem: Decodable, Identifiable {
         let name: String
         let estimatedDimensions: String
+        let estimatedVolumeMilliliters: Int
         let estimatedWeightGrams: Int
+        let assumedCarbsPer100Grams: Double
+        let portionConfidence: String
+        let carbDensityConfidence: String
         let carbsGrams: Int
+        let calculationExplanation: String
         let highFat: Bool
 
         var id: String {
-            "\(name)-\(estimatedDimensions)-\(estimatedWeightGrams)-\(carbsGrams)"
+            "\(name)-\(estimatedDimensions)-\(estimatedVolumeMilliliters)-\(estimatedWeightGrams)-\(carbsGrams)"
         }
 
         enum CodingKeys: String, CodingKey {
             case name
             case estimatedDimensions = "estimated_dimensions"
+            case estimatedVolumeMilliliters = "estimated_volume_ml"
             case estimatedWeightGrams = "estimated_weight_grams"
+            case assumedCarbsPer100Grams = "assumed_carbs_per_100g"
+            case portionConfidence = "portion_confidence"
+            case carbDensityConfidence = "carb_density_confidence"
             case carbsGrams = "carbs_grams"
+            case calculationExplanation = "calculation_explanation"
             case highFat = "high_fat"
         }
     }
@@ -1352,8 +1384,8 @@ struct OpenAIMealEstimatorClient {
                 schemaName: "meal_carb_estimate",
                 responseSchema: mealResponseSchema,
                 imageDetail: "high",
-                reasoningEffort: "low",
-                maxOutputTokens: 2000
+                reasoningEffort: "medium",
+                maxOutputTokens: 4000
             )
         )
 
@@ -1377,7 +1409,10 @@ struct OpenAIMealEstimatorClient {
         do {
             return try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
         } catch {
-            throw ClientError.requestFailed("OpenAI returned an estimate, but it did not match the expected carb JSON format.")
+            let preview = String(outputText.prefix(700))
+            throw ClientError.requestFailed(
+                "OpenAI returned an estimate, but it did not match the expected carb JSON format. Decode error: \(error.localizedDescription). Returned JSON starts: \(preview)"
+            )
         }
     }
 
@@ -1492,8 +1527,9 @@ struct OpenAIMealEstimatorClient {
         Estimate carbohydrates from the visible meal photo for user confirmation only. Do not provide insulin dosing advice. \(calibrationText)
         Return strict structured JSON only. First identify every visible food item. Do not collapse distinct foods into one item unless they are visually inseparable.
         Detect whether any usable scale reference is visible, including the user's hand based on previous credit-card calibration. Set reference_detected to true only when a visible reference can be used for scale, and describe it in reference_description.
-        For every item, estimate physical dimensions before weight. Then estimate weight. Then estimate carbs for that item.
-        Sum the per-item carbs into total_carbs_grams. Include a required confidence_interval_grams lower_bound and upper_bound for total carbs.
+        For every item, estimate physical dimensions first, then estimate volume in milliliters, then estimate weight in grams. Then select an assumed carbohydrate density in grams of carbohydrate per 100 grams of that food. Calculate carbs_grams from estimated_weight_grams and assumed_carbs_per_100g. Do not choose carbs_grams independently.
+        For each item, include portion_confidence for the volume/weight estimate and carb_density_confidence for the carbohydrate density assumption. Keep calculation_explanation under 18 words and briefly state the weight, carb density, and resulting carb calculation.
+        Sum the per-item carbs into total_carbs_grams. Do not revise total carbs after summing item carbs. total_carbs_grams must equal the sum of food_items.carbs_grams. Include a required confidence_interval_grams lower_bound and upper_bound for total carbs.
         If no usable hand or scale reference is visible, set reference_detected to false, confidence to low, use a wider confidence interval, and explain that retaking the photo with their hand visible will improve the estimate.
         Estimate each value conservatively from the image. high_fat should be true when the visible meal appears likely high in fat.
         """
@@ -1520,7 +1556,7 @@ struct OpenAIMealEstimatorClient {
                 ],
                 "food_items": [
                     "type": "array",
-                    "description": "Every visible food item with dimensions, weight, carbs, and high-fat flag.",
+                    "description": "Every visible food item with dimensions, volume, weight, carb density, carbs, confidence details, and high-fat flag.",
                     "items": [
                         "type": "object",
                         "additionalProperties": false,
@@ -1533,13 +1569,35 @@ struct OpenAIMealEstimatorClient {
                                 "type": "string",
                                 "description": "Estimated physical dimensions or portion size of this item."
                             ],
+                            "estimated_volume_ml": [
+                                "type": "integer",
+                                "description": "Estimated volume of this item in milliliters, inferred from visible dimensions and portion shape."
+                            ],
                             "estimated_weight_grams": [
                                 "type": "integer",
-                                "description": "Estimated weight of this item in grams."
+                                "description": "Estimated weight of this item in grams, inferred from estimated volume and likely food density."
+                            ],
+                            "assumed_carbs_per_100g": [
+                                "type": "number",
+                                "description": "Assumed grams of carbohydrate per 100 grams of this food."
+                            ],
+                            "portion_confidence": [
+                                "type": "string",
+                                "enum": ["low", "medium", "high"],
+                                "description": "Confidence in the visual portion, volume, and weight estimate."
+                            ],
+                            "carb_density_confidence": [
+                                "type": "string",
+                                "enum": ["low", "medium", "high"],
+                                "description": "Confidence in the assumed carbohydrate density for this food."
                             ],
                             "carbs_grams": [
                                 "type": "integer",
-                                "description": "Estimated carbohydrates for this item in grams."
+                                "description": "Estimated carbohydrates for this item in grams, calculated from estimated_weight_grams and assumed_carbs_per_100g."
+                            ],
+                            "calculation_explanation": [
+                                "type": "string",
+                                "description": "Brief explanation of the item carb calculation, including weight and carbohydrate density assumptions."
                             ],
                             "high_fat": [
                                 "type": "boolean",
@@ -1549,8 +1607,13 @@ struct OpenAIMealEstimatorClient {
                         "required": [
                             "name",
                             "estimated_dimensions",
+                            "estimated_volume_ml",
                             "estimated_weight_grams",
+                            "assumed_carbs_per_100g",
+                            "portion_confidence",
+                            "carb_density_confidence",
                             "carbs_grams",
+                            "calculation_explanation",
                             "high_fat"
                         ]
                     ]
