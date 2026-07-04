@@ -167,11 +167,15 @@ extension Treatments {
             Button {
                 aiMealEstimatorViewModel.loadAPIKey()
                 aiMealEstimatorViewModel.errorMessage = nil
-                if aiMealEstimatorViewModel.handCalibration == nil {
-                    showHandCalibration = true
-                } else {
-                    showAIMealCamera = true
-                }
+                #if targetEnvironment(simulator)
+                    showAIMealPhotoLibrary = true
+                #else
+                    if aiMealEstimatorViewModel.handCalibration == nil {
+                        showHandCalibration = true
+                    } else {
+                        showAIMealCamera = true
+                    }
+                #endif
             } label: {
                 if aiMealEstimatorViewModel.isEstimating {
                     HStack {
@@ -183,7 +187,15 @@ extension Treatments {
                 }
             }
             .buttonStyle(.borderless)
-            .disabled(aiMealEstimatorViewModel.isEstimating || !UIImagePickerController.isSourceTypeAvailable(.camera))
+            .disabled(aiMealEstimatorViewModel.isEstimating || !aiMealImageSourceAvailable)
+        }
+
+        private var aiMealImageSourceAvailable: Bool {
+            #if targetEnvironment(simulator)
+                UIImagePickerController.isSourceTypeAvailable(.photoLibrary)
+            #else
+                UIImagePickerController.isSourceTypeAvailable(.camera)
+            #endif
         }
 
         private var handCalibrationButton: some View {
@@ -958,6 +970,34 @@ struct HandCalibrationView: View {
         return value
     }
 
+    private var handCalibrationImageSourceType: UIImagePickerController.SourceType {
+        #if targetEnvironment(simulator)
+            .photoLibrary
+        #else
+                .camera
+        #endif
+    }
+
+    private var handCalibrationImageSourceAvailable: Bool {
+        UIImagePickerController.isSourceTypeAvailable(handCalibrationImageSourceType)
+    }
+
+    private var handCalibrationImageButtonTitle: LocalizedStringKey {
+        #if targetEnvironment(simulator)
+            "Choose Hand Photo with Credit Card"
+        #else
+            "Capture Hand with Credit Card"
+        #endif
+    }
+
+    private var handCalibrationImageButtonIcon: String {
+        #if targetEnvironment(simulator)
+            "photo.on.rectangle"
+        #else
+            "camera"
+        #endif
+    }
+
     var body: some View {
         NavigationStack {
             Form {
@@ -966,9 +1006,9 @@ struct HandCalibrationView: View {
                         Button {
                             showCamera = true
                         } label: {
-                            Label("Capture Hand with Credit Card", systemImage: "camera")
+                            Label(handCalibrationImageButtonTitle, systemImage: handCalibrationImageButtonIcon)
                         }
-                        .disabled(isEstimating || !UIImagePickerController.isSourceTypeAvailable(.camera))
+                        .disabled(isEstimating || !handCalibrationImageSourceAvailable)
                     }
 
                     if let capturedReferenceImage {
@@ -1028,7 +1068,7 @@ struct HandCalibrationView: View {
                 }
             }
             .sheet(isPresented: $showCamera) {
-                AIMealCameraPicker { image in
+                AIMealCameraPicker(sourceType: handCalibrationImageSourceType) { image in
                     capturedReferenceImage = image
                     Task {
                         await estimatePalmWidth(from: image)
