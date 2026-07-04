@@ -13,6 +13,7 @@ extension Treatments {
             case fat
             case protein
             case bolus
+            case openAIAPIKey
         }
 
         @FocusState private var focusedField: FocusedField?
@@ -25,6 +26,7 @@ extension Treatments {
         @State private var showAIMealCamera = false
         @State private var showAIMealPhotoLibrary = false
         @State private var showHandCalibration = false
+        @State private var showOpenAIAPIKeyField = false
         @State private var aiMealEstimatorViewModel = AIMealEstimatorViewModel()
         @State private var autofocus: Bool = true
         @State private var calculatorDetent = PresentationDetent.large
@@ -167,6 +169,12 @@ extension Treatments {
             Button {
                 aiMealEstimatorViewModel.loadAPIKey()
                 aiMealEstimatorViewModel.errorMessage = nil
+                guard aiMealEstimatorViewModel.isAPIKeySaved else {
+                    focusOpenAIAPIKeyField()
+                    aiMealEstimatorViewModel.errorMessage = OpenAIMealEstimatorClient.ClientError.missingAPIKey
+                        .localizedDescription
+                    return
+                }
                 #if targetEnvironment(simulator)
                     showAIMealPhotoLibrary = true
                 #else
@@ -187,7 +195,66 @@ extension Treatments {
                 }
             }
             .buttonStyle(.borderless)
-            .disabled(aiMealEstimatorViewModel.isEstimating || !aiMealImageSourceAvailable)
+            .disabled(
+                aiMealEstimatorViewModel.isEstimating || !aiMealImageSourceAvailable || !aiMealEstimatorViewModel.isAPIKeySaved
+            )
+        }
+
+        @ViewBuilder private var openAIAPIKeyField: some View {
+            if showOpenAIAPIKeyField || !aiMealEstimatorViewModel.isAPIKeySaved {
+                VStack(alignment: .leading, spacing: 8) {
+                    SecureField("OpenAI API key", text: $aiMealEstimatorViewModel.apiKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .focused($focusedField, equals: .openAIAPIKey)
+                        .padding(8)
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 6)
+                                .stroke(aiMealEstimatorViewModel.isAPIKeySaved ? Color.clear : Color.red, lineWidth: 1.5)
+                        }
+                        .onSubmit {
+                            saveOpenAIAPIKey()
+                        }
+
+                    HStack {
+                        Text("Saved locally in Keychain.")
+                            .font(.caption)
+                            .foregroundStyle(aiMealEstimatorViewModel.isAPIKeySaved ? Color.secondary : Color.red)
+
+                        Spacer()
+
+                        Button("Save") {
+                            saveOpenAIAPIKey()
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(!aiMealEstimatorViewModel.hasAPIKey)
+                    }
+                }
+            } else {
+                HStack {
+                    Label("OpenAI API key saved", systemImage: "key.fill")
+                    Spacer()
+                    Button("Edit") {
+                        showOpenAIAPIKeyField = true
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+        }
+
+        private func saveOpenAIAPIKey() {
+            aiMealEstimatorViewModel.saveAPIKey()
+            if aiMealEstimatorViewModel.errorMessage == nil {
+                showOpenAIAPIKeyField = false
+                focusedField = nil
+            }
+        }
+
+        private func focusOpenAIAPIKeyField() {
+            showOpenAIAPIKeyField = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                focusedField = .openAIAPIKey
+            }
         }
 
         private var aiMealImageSourceAvailable: Bool {
@@ -202,6 +269,12 @@ extension Treatments {
             Button {
                 aiMealEstimatorViewModel.loadAPIKey()
                 aiMealEstimatorViewModel.errorMessage = nil
+                guard aiMealEstimatorViewModel.isAPIKeySaved else {
+                    focusOpenAIAPIKeyField()
+                    aiMealEstimatorViewModel.errorMessage = OpenAIMealEstimatorClient.ClientError.missingAPIKey
+                        .localizedDescription
+                    return
+                }
                 showHandCalibration = true
             } label: {
                 if let handCalibration = aiMealEstimatorViewModel.handCalibration {
@@ -211,6 +284,7 @@ extension Treatments {
                 }
             }
             .buttonStyle(.borderless)
+            .disabled(!aiMealEstimatorViewModel.isAPIKeySaved)
         }
 
         @ViewBuilder private var aiMealEstimatorResult: some View {
@@ -283,6 +357,8 @@ extension Treatments {
                 return showFPU ? .protein : .bolus
             case .bolus:
                 return .carbs
+            case .openAIAPIKey:
+                return .carbs
             }
         }
 
@@ -305,6 +381,8 @@ extension Treatments {
                 return .bolus
             case .bolus:
                 return showFPU ? .fat : .carbs
+            case .openAIAPIKey:
+                return nil
             }
         }
 
@@ -319,6 +397,7 @@ extension Treatments {
 
                         Section {
                             carbsTextField()
+                            openAIAPIKeyField
                             aiMealEstimatorButton
                             handCalibrationButton
                             aiMealEstimatorResult
@@ -534,6 +613,11 @@ extension Treatments {
                     state.isActive = true
                     Task { @MainActor in
                         state.insulinCalculated = await state.calculateInsulin()
+                    }
+
+                    aiMealEstimatorViewModel.loadAPIKey()
+                    if !aiMealEstimatorViewModel.isAPIKeySaved {
+                        focusOpenAIAPIKeyField()
                     }
 
                     if PropertyPersistentFlags.shared.hasSeenFatProteinOrderChange != true {
@@ -874,16 +958,46 @@ extension Treatments {
     var apiKey = ""
     var carbEstimate: AIMealCarbEstimate?
     var handCalibration = HandCalibrationStore.load()
+    var isAPIKeySaved = false
     var isEstimating = false
     var errorMessage: String?
 
     var canEstimate: Bool {
-        selectedImage != nil && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isEstimating
+        selectedImage != nil && isAPIKeySaved && !isEstimating
+    }
+
+    var hasAPIKey: Bool {
+        !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     func loadAPIKey() {
         let hardcodedAPIKey = Config.hardcodedOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        apiKey = hardcodedAPIKey.isEmpty ? keychain.getValue(String.self, forKey: Config.openAIAPIKeyKey) ?? "" : hardcodedAPIKey
+        if hardcodedAPIKey.isEmpty {
+            apiKey = keychain.getValue(String.self, forKey: Config.openAIAPIKeyKey) ?? ""
+        } else {
+            apiKey = hardcodedAPIKey
+        }
+        isAPIKeySaved = !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    func saveAPIKey() {
+        let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedAPIKey.isEmpty else {
+            errorMessage = OpenAIMealEstimatorClient.ClientError.missingAPIKey.localizedDescription
+            return
+        }
+
+        guard Config.hardcodedOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            apiKey = Config.hardcodedOpenAIAPIKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            isAPIKeySaved = true
+            errorMessage = nil
+            return
+        }
+
+        keychain.setValue(trimmedAPIKey, forKey: Config.openAIAPIKeyKey)
+        apiKey = trimmedAPIKey
+        isAPIKeySaved = true
+        errorMessage = nil
     }
 
     func setSelectedImage(_ image: UIImage) {
