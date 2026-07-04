@@ -407,6 +407,9 @@ extension Treatments {
                                     .aiResultWrapped()
                                     Text("Reference: \(trial.referenceDetected ? trial.referenceDescription : "Not detected")")
                                         .aiResultWrapped()
+                                    Text(trial.usageSummary)
+                                        .aiResultWrapped()
+                                        .foregroundStyle(.secondary)
                                     Text(trial.itemSummary)
                                         .aiResultWrapped()
                                         .foregroundStyle(.secondary)
@@ -1155,12 +1158,12 @@ extension Treatments {
                 }
 
                 for runNumber in 1 ... count {
-                    let estimate = try await estimatorClient.estimateCarbs(
+                    let result = try await estimatorClient.estimateCarbsWithDebugUsage(
                         from: selectedImage,
                         calibration: handCalibration,
                         apiKey: trimmedAPIKey
                     )
-                    debugEstimateTrials.append(AIDebugEstimateTrial(runNumber: runNumber, estimate: estimate))
+                    debugEstimateTrials.append(AIDebugEstimateTrial(runNumber: runNumber, result: result))
                 }
             } catch {
                 errorMessage = error.localizedDescription
@@ -1180,15 +1183,18 @@ extension Treatments {
         let confidence: String
         let referenceDetected: Bool
         let referenceDescription: String
+        let usageSummary: String
         let itemSummary: String
 
-        init(runNumber: Int, estimate: AIMealCarbEstimate) {
+        init(runNumber: Int, result: OpenAIMealEstimateDebugResult) {
             self.runNumber = runNumber
+            let estimate = result.estimate
             totalCarbsGrams = estimate.totalCarbsGrams
             confidenceInterval = estimate.confidenceIntervalGrams
             confidence = estimate.confidence
             referenceDetected = estimate.referenceDetected
             referenceDescription = estimate.referenceDescription
+            usageSummary = result.usageSummary
             itemSummary = estimate.foodItems.map { item in
                 String(
                     format: "%@: %d g carbs, %d g weight, %.1f g/100 g density, %@ portion, %@ density",
@@ -1495,9 +1501,28 @@ struct OpenAIMealEstimatorClient {
     }
 
     private let endpoint = URL(string: "https://api.openai.com/v1/responses")!
-    private let model = "gpt-5"
+    private let model = "gpt-5.5"
 
     func estimateCarbs(from image: UIImage, calibration: HandCalibration?, apiKey: String) async throws -> AIMealCarbEstimate {
+        try await estimateCarbsResponse(from: image, calibration: calibration, apiKey: apiKey).estimate
+    }
+
+    #if DEBUG
+        func estimateCarbsWithDebugUsage(
+            from image: UIImage,
+            calibration: HandCalibration?,
+            apiKey: String
+        ) async throws -> OpenAIMealEstimateDebugResult {
+            let response = try await estimateCarbsResponse(from: image, calibration: calibration, apiKey: apiKey)
+            return OpenAIMealEstimateDebugResult(estimate: response.estimate, usage: response.usage)
+        }
+    #endif
+
+    private func estimateCarbsResponse(
+        from image: UIImage,
+        calibration: HandCalibration?,
+        apiKey: String
+    ) async throws -> OpenAIMealEstimateResponse {
         guard let imageData = image.jpegData(compressionQuality: 0.93) else {
             throw ClientError.invalidImage
         }
@@ -1514,7 +1539,7 @@ struct OpenAIMealEstimatorClient {
                 schemaName: "meal_carb_estimate",
                 responseSchema: mealResponseSchema,
                 imageDetail: "high",
-                reasoningEffort: "medium",
+                reasoningEffort: "low",
                 maxOutputTokens: 4000
             )
         )
@@ -1537,7 +1562,8 @@ struct OpenAIMealEstimatorClient {
         }
 
         do {
-            return try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
+            let estimate = try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
+            return OpenAIMealEstimateResponse(estimate: estimate, usage: responseBody.usage)
         } catch {
             let preview = String(outputText.prefix(700))
             throw ClientError.requestFailed(
@@ -1828,6 +1854,51 @@ struct OpenAIMealEstimatorClient {
     }
 }
 
+struct OpenAIMealEstimateResponse {
+    let estimate: AIMealCarbEstimate
+    let usage: OpenAIResponseUsage?
+}
+
+#if DEBUG
+    struct OpenAIMealEstimateDebugResult {
+        let estimate: AIMealCarbEstimate
+        let usage: OpenAIResponseUsage?
+
+        var usageSummary: String {
+            guard let usage else { return "Tokens: unavailable; approx cost unavailable" }
+
+            let input = usage.inputTokens.map(String.init) ?? "?"
+            let output = usage.outputTokens.map(String.init) ?? "?"
+            let total = usage.totalTokens.map(String.init) ?? "?"
+            let cost = usage.approximateCostUSD.map { String(format: "$%.4f", $0) } ?? "unavailable"
+            return "Tokens: \(input) input, \(output) output, \(total) total; approx cost: \(cost)"
+        }
+    }
+#endif
+
+struct OpenAIResponseUsage: Decodable {
+    private static let approximateInputDollarsPerMillionTokens = 5.00
+    private static let approximateOutputDollarsPerMillionTokens = 30.00
+
+    let inputTokens: Int?
+    let outputTokens: Int?
+    let totalTokens: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case inputTokens = "input_tokens"
+        case outputTokens = "output_tokens"
+        case totalTokens = "total_tokens"
+    }
+
+    var approximateCostUSD: Double? {
+        guard let inputTokens, let outputTokens else { return nil }
+
+        let inputCost = Double(inputTokens) / 1_000_000 * Self.approximateInputDollarsPerMillionTokens
+        let outputCost = Double(outputTokens) / 1_000_000 * Self.approximateOutputDollarsPerMillionTokens
+        return inputCost + outputCost
+    }
+}
+
 private struct OpenAIResponsesBody: Decodable {
     struct IncompleteDetails: Decodable {
         let reason: String?
@@ -1845,11 +1916,13 @@ private struct OpenAIResponsesBody: Decodable {
     let status: String?
     let incompleteDetails: IncompleteDetails?
     let output: [Output]
+    let usage: OpenAIResponseUsage?
 
     enum CodingKeys: String, CodingKey {
         case status
         case incompleteDetails = "incomplete_details"
         case output
+        case usage
     }
 
     init(from decoder: Decoder) throws {
@@ -1857,6 +1930,7 @@ private struct OpenAIResponsesBody: Decodable {
         status = try container.decodeIfPresent(String.self, forKey: .status)
         incompleteDetails = try container.decodeIfPresent(IncompleteDetails.self, forKey: .incompleteDetails)
         output = try container.decodeIfPresent([Output].self, forKey: .output) ?? []
+        usage = try container.decodeIfPresent(OpenAIResponseUsage.self, forKey: .usage)
     }
 
     var outputText: String? {
