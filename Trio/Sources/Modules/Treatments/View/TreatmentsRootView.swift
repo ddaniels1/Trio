@@ -362,6 +362,64 @@ extension Treatments {
             }
         }
 
+        @ViewBuilder private var aiMealDebugHarness: some View {
+            #if DEBUG
+                if aiMealEstimatorViewModel.selectedImage != nil {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Button {
+                            Task {
+                                await aiMealEstimatorViewModel.runDebugEstimateTrials()
+                            }
+                        } label: {
+                            if aiMealEstimatorViewModel.isRunningDebugEstimateTrials {
+                                HStack {
+                                    ProgressView()
+                                    Text("Running AI variance test...")
+                                }
+                            } else {
+                                Label("Run AI Variance Test", systemImage: "repeat")
+                            }
+                        }
+                        .buttonStyle(.borderless)
+                        .disabled(
+                            !aiMealEstimatorViewModel.isAPIKeySaved || aiMealEstimatorViewModel
+                                .isRunningDebugEstimateTrials
+                        )
+
+                        if !aiMealEstimatorViewModel.debugEstimateTrials.isEmpty {
+                            let totals = aiMealEstimatorViewModel.debugEstimateTrials.map(\.totalCarbsGrams)
+                            let low = totals.min() ?? 0
+                            let high = totals.max() ?? 0
+                            let average = Double(totals.reduce(0, +)) / Double(max(totals.count, 1))
+
+                            Text("Debug variance: \(low)-\(high) g, average \(average, specifier: "%.1f") g")
+                                .aiResultWrapped()
+                                .fontWeight(.semibold)
+
+                            ForEach(aiMealEstimatorViewModel.debugEstimateTrials) { trial in
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text("Run \(trial.runNumber): \(trial.totalCarbsGrams) g")
+                                        .aiResultWrapped()
+                                        .fontWeight(.semibold)
+                                    Text(
+                                        "Range: \(trial.confidenceInterval.lowerBound)-\(trial.confidenceInterval.upperBound) g, confidence: \(trial.confidence)"
+                                    )
+                                    .aiResultWrapped()
+                                    Text("Reference: \(trial.referenceDetected ? trial.referenceDescription : "Not detected")")
+                                        .aiResultWrapped()
+                                    Text(trial.itemSummary)
+                                        .aiResultWrapped()
+                                        .foregroundStyle(.secondary)
+                                }
+                                .padding(.top, 4)
+                            }
+                        }
+                    }
+                    .font(.footnote)
+                }
+            #endif
+        }
+
         private func estimateCarbsFromCapturedMeal(_ image: UIImage) async {
             aiMealEstimatorViewModel.setSelectedImage(image)
             await aiMealEstimatorViewModel.estimateCarbs()
@@ -434,6 +492,7 @@ extension Treatments {
                             aiMealEstimatorButton
                             handCalibrationButton
                             aiMealEstimatorResult
+                            aiMealDebugHarness
 
                             if state.useFPUconversion {
                                 proteinAndFat()
@@ -995,6 +1054,11 @@ extension Treatments {
     var isEstimating = false
     var errorMessage: String?
 
+    #if DEBUG
+        var debugEstimateTrials: [AIDebugEstimateTrial] = []
+        var isRunningDebugEstimateTrials = false
+    #endif
+
     var canEstimate: Bool {
         selectedImage != nil && isAPIKeySaved && !isEstimating
     }
@@ -1037,6 +1101,9 @@ extension Treatments {
         selectedImage = image
         carbEstimate = nil
         errorMessage = nil
+        #if DEBUG
+            debugEstimateTrials = []
+        #endif
     }
 
     func saveHandCalibration(_ calibration: HandCalibration) {
@@ -1072,7 +1139,70 @@ extension Treatments {
 
         isEstimating = false
     }
+
+    #if DEBUG
+        func runDebugEstimateTrials(count: Int = 5) async {
+            guard let selectedImage else { return }
+
+            isRunningDebugEstimateTrials = true
+            errorMessage = nil
+            debugEstimateTrials = []
+
+            do {
+                let trimmedAPIKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmedAPIKey.isEmpty else {
+                    throw OpenAIMealEstimatorClient.ClientError.missingAPIKey
+                }
+
+                for runNumber in 1 ... count {
+                    let estimate = try await estimatorClient.estimateCarbs(
+                        from: selectedImage,
+                        calibration: handCalibration,
+                        apiKey: trimmedAPIKey
+                    )
+                    debugEstimateTrials.append(AIDebugEstimateTrial(runNumber: runNumber, estimate: estimate))
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+
+            isRunningDebugEstimateTrials = false
+        }
+    #endif
 }
+
+#if DEBUG
+    struct AIDebugEstimateTrial: Identifiable {
+        let id = UUID()
+        let runNumber: Int
+        let totalCarbsGrams: Int
+        let confidenceInterval: AIMealCarbEstimate.ConfidenceIntervalGrams
+        let confidence: String
+        let referenceDetected: Bool
+        let referenceDescription: String
+        let itemSummary: String
+
+        init(runNumber: Int, estimate: AIMealCarbEstimate) {
+            self.runNumber = runNumber
+            totalCarbsGrams = estimate.totalCarbsGrams
+            confidenceInterval = estimate.confidenceIntervalGrams
+            confidence = estimate.confidence
+            referenceDetected = estimate.referenceDetected
+            referenceDescription = estimate.referenceDescription
+            itemSummary = estimate.foodItems.map { item in
+                String(
+                    format: "%@: %d g carbs, %d g weight, %.1f g/100 g density, %@ portion, %@ density",
+                    item.name,
+                    item.carbsGrams,
+                    item.estimatedWeightGrams,
+                    item.assumedCarbsPer100Grams,
+                    item.portionConfidence,
+                    item.carbDensityConfidence
+                )
+            }.joined(separator: "; ")
+        }
+    }
+#endif
 
 struct HandCalibration: Codable {
     let indexFingerPIPWidthCm: Double
