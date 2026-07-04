@@ -373,6 +373,8 @@ extension Treatments {
                             .aiResultWrapped()
                             .foregroundStyle(.secondary)
                     }
+
+                    personalLearningSummaryPanel
                 }
                 .font(.footnote)
             }
@@ -446,12 +448,62 @@ extension Treatments {
             #endif
         }
 
+        private func formatted(_ value: Decimal) -> String {
+            NSDecimalNumber(decimal: value).rounding(accordingToBehavior: nil).stringValue
+        }
+
+        @ViewBuilder private var personalLearningSummaryPanel: some View {
+            if let summary = state.latestPersonalLearningSummary,
+               let suggestion = state.latestPersonalLearningSuggestion
+            {
+                Divider()
+                    .padding(.vertical, 4)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Personal learning advisory")
+                        .font(.subheadline)
+                        .fontWeight(.semibold)
+
+                    Text("Based on your prior meals, this may suggest a pattern. Review before using. Not medical advice.")
+                        .foregroundStyle(.secondary)
+
+                    Text("Prior similar meals: \(summary.numberOfPriorMeals)")
+
+                    if let averageUserConfirmedCarbs = summary.averageUserConfirmedCarbs {
+                        Text("Prior average confirmed carbs: \(formatted(averageUserConfirmedCarbs)) g")
+                    }
+
+                    if let averageCorrection = summary.averageCorrection {
+                        Text("Prior average correction: \(formatted(averageCorrection)) g")
+                    }
+
+                    if let outcome = summary.mostCommonOutcomeClassification {
+                        Text("Typical glucose pattern: \(outcome.rawValue)")
+                    }
+
+                    if let absorption = summary.typicalAbsorptionClassification {
+                        Text("Typical absorption: \(PersonalLearningAnalyzer.displayName(for: absorption))")
+                    }
+
+                    if let range = summary.mostSuccessfulBolusTimingRange {
+                        Text("Prior successful bolus timing: \(range.lowerBound)-\(range.upperBound) minutes before meal")
+                    }
+
+                    ForEach(suggestion.advisoryMessages, id: \.self) { message in
+                        Text(message)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+
         private func estimateCarbsFromCapturedMeal(_ image: UIImage) async {
             aiMealEstimatorViewModel.setSelectedImage(image)
             await aiMealEstimatorViewModel.estimateCarbs()
 
             guard let carbEstimate = aiMealEstimatorViewModel.carbEstimate else { return }
             state.carbs = Decimal(carbEstimate.totalCarbsGrams)
+            await state.setPendingLearningContext(carbEstimate.learningContext)
         }
 
         /// Determines the next field to focus on based on the current focused field.
@@ -731,6 +783,9 @@ extension Treatments {
                     state.isActive = true
                     Task { @MainActor in
                         state.insulinCalculated = await state.calculateInsulin()
+                    }
+                    Task {
+                        await state.backfillPersonalLearningOutcomes()
                     }
 
                     aiMealEstimatorViewModel.loadAPIKey()
@@ -1486,6 +1541,24 @@ struct HandCalibrationView: View {
         }
 
         isEstimating = false
+    }
+}
+
+extension AIMealCarbEstimate {
+    var learningContext: PendingAIMealLearningContext {
+        let description = foodItems.map(\.name).joined(separator: ", ")
+        let category = foodItems.count == 1 ? foodItems[0].name : "mixed meal"
+        let highFat = foodItems.contains { $0.highFat }
+
+        return PendingAIMealLearningContext(
+            aiMealDescription: description.isEmpty ? "AI photo meal" : description,
+            aiFoodCategory: category,
+            aiEstimatedCarbs: Decimal(totalCarbsGrams),
+            aiHighFatFlag: highFat,
+            aiEstimatedAbsorptionType: highFat ? .delayedHighFatPattern : nil,
+            restaurantName: nil,
+            imageReference: nil
+        )
     }
 }
 

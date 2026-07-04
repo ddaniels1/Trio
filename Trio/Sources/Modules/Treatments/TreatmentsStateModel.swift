@@ -19,6 +19,8 @@ extension Treatments {
         @ObservationIgnored @Injected() var glucoseStorage: GlucoseStorage!
         @ObservationIgnored @Injected() var determinationStorage: DeterminationStorage!
         @ObservationIgnored @Injected() var bolusCalculationManager: BolusCalculationManager!
+        @ObservationIgnored @Injected() var personalLearningStorage: PersonalLearningStorage!
+        @ObservationIgnored @Injected() var personalLearningOutcomeBackfill: PersonalLearningOutcomeBackfill!
 
         var lowGlucose: Decimal = 70
         var highGlucose: Decimal = 180
@@ -87,6 +89,9 @@ extension Treatments {
         var fat: Decimal = 0
         var protein: Decimal = 0
         var note: String = ""
+        var pendingAIMealLearningContext: PendingAIMealLearningContext?
+        var latestPersonalLearningSummary: PersonalLearningSummary?
+        var latestPersonalLearningSuggestion: PersonalizedAdjustmentSuggestion?
 
         var date = Date()
         let defaultDate = Date()
@@ -624,6 +629,73 @@ extension Treatments {
             }
         }
 
+        func backfillPersonalLearningOutcomes() async {
+            await personalLearningOutcomeBackfill.backfillCompletedOutcomes(now: Date())
+        }
+
+        func setPendingLearningContext(_ context: PendingAIMealLearningContext) async {
+            let summary = await personalLearningStorage.summary(similarTo: context)
+            let suggestion = await personalLearningStorage.suggestion(for: context)
+
+            await MainActor.run {
+                self.pendingAIMealLearningContext = context
+                self.latestPersonalLearningSummary = summary
+                self.latestPersonalLearningSuggestion = suggestion
+            }
+        }
+
+        private func savePersonalLearningRecordIfNeeded(mealTimestamp: Date) async {
+            guard let context = pendingAIMealLearningContext else { return }
+
+            let currentGlucose = glucoseFromPersistence.first
+            let recordId = UUID()
+            let bolusTimestamp = Date()
+            let minutesPreBolus = amount > 0 ? PersonalLearningAnalyzer.calculateBolusTiming(
+                bolusTimestamp: bolusTimestamp,
+                mealTimestamp: mealTimestamp
+            ) : nil
+
+            let bolusTiming = minutesPreBolus.map { minutesPreBolus in
+                BolusTimingRecord(
+                    id: UUID(),
+                    mealLearningRecordId: recordId,
+                    bolusTimestamp: bolusTimestamp,
+                    mealTimestamp: mealTimestamp,
+                    minutesPreBolus: minutesPreBolus,
+                    glucoseAtBolus: currentGlucose.map { Int($0.glucose) },
+                    glucoseAtMeal: currentGlucose.map { Int($0.glucose) },
+                    trendAtBolus: currentGlucose?.direction,
+                    trendAtMeal: currentGlucose?.direction,
+                    bolusAmount: amount,
+                    bolusStrategy: PersonalLearningAnalyzer.classifyBolusStrategy(minutesPreBolus: minutesPreBolus)
+                )
+            }
+
+            let record = MealLearningRecord(
+                id: recordId,
+                createdAt: Date(),
+                mealTimestamp: mealTimestamp,
+                aiMealDescription: context.aiMealDescription,
+                aiFoodCategory: context.aiFoodCategory,
+                aiEstimatedCarbs: context.aiEstimatedCarbs,
+                userConfirmedCarbs: carbs,
+                carbCorrection: PersonalLearningAnalyzer.calculateCarbCorrection(
+                    aiEstimate: context.aiEstimatedCarbs,
+                    userConfirmedCarbs: carbs
+                ),
+                aiHighFatFlag: context.aiHighFatFlag,
+                aiEstimatedAbsorptionType: context.aiEstimatedAbsorptionType,
+                restaurantName: context.restaurantName,
+                imageReference: context.imageReference,
+                notes: note.isEmpty ? nil : note,
+                glucoseOutcome: nil,
+                bolusTiming: bolusTiming,
+                foodAbsorption: nil
+            )
+
+            await personalLearningStorage.saveMealLearningRecord(record)
+        }
+
         // MARK: - Carbs
 
         func saveMeal() async {
@@ -650,6 +722,8 @@ extension Treatments {
                     fpuID: fat > 0 || protein > 0 ? UUID().uuidString : nil
                 )]
                 try await carbsStorage.storeCarbs(carbsToStore, areFetchedFromRemote: false)
+                await savePersonalLearningRecordIfNeeded(mealTimestamp: date)
+                await backfillPersonalLearningOutcomes()
 
                 // only perform determine basal sync if the user doesn't use the pump bolus, otherwise the enact bolus func in the APSManger does a sync
                 if amount <= 0 {
