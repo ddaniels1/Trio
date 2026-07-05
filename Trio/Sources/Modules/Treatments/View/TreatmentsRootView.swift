@@ -287,7 +287,7 @@ extension Treatments {
             } label: {
                 if let handCalibration = aiMealEstimatorViewModel.handCalibration {
                     Label(
-                        "Index finger scale: \(handCalibration.indexFingerPIPWidthCm, specifier: "%.1f") cm",
+                        "Hand scale: \(handCalibration.primaryScaleDescription)",
                         systemImage: "hand.raised"
                     )
                 } else {
@@ -1211,9 +1211,45 @@ extension Treatments {
 #endif
 
 struct HandCalibration: Codable {
-    let indexFingerPIPWidthCm: Double
+    let thumbLengthCm: Double?
+    let thumbBaseToIndexTipCm: Double?
+    let indexFingerLengthCm: Double?
+    let indexFingerPIPWidthCm: Double?
     let calibratedAt: Date
     let calibratedWithCreditCard: Bool
+
+    init(
+        thumbLengthCm: Double? = nil,
+        thumbBaseToIndexTipCm: Double? = nil,
+        indexFingerLengthCm: Double? = nil,
+        indexFingerPIPWidthCm: Double? = nil,
+        calibratedAt: Date,
+        calibratedWithCreditCard: Bool
+    ) {
+        self.thumbLengthCm = thumbLengthCm
+        self.thumbBaseToIndexTipCm = thumbBaseToIndexTipCm
+        self.indexFingerLengthCm = indexFingerLengthCm
+        self.indexFingerPIPWidthCm = indexFingerPIPWidthCm
+        self.calibratedAt = calibratedAt
+        self.calibratedWithCreditCard = calibratedWithCreditCard
+    }
+
+    var primaryScaleDescription: String {
+        var components: [String] = []
+        if let thumbLengthCm {
+            components.append(String(format: "thumb %.1f cm", thumbLengthCm))
+        }
+        if let thumbBaseToIndexTipCm {
+            components.append(String(format: "thumb-base to index-tip %.1f cm", thumbBaseToIndexTipCm))
+        }
+        if let indexFingerLengthCm {
+            components.append(String(format: "legacy index %.1f cm", indexFingerLengthCm))
+        }
+        if let indexFingerPIPWidthCm {
+            components.append(String(format: "legacy PIP %.1f cm", indexFingerPIPWidthCm))
+        }
+        return components.joined(separator: ", ")
+    }
 }
 
 enum HandCalibrationStore {
@@ -1233,7 +1269,8 @@ enum HandCalibrationStore {
 struct HandCalibrationView: View {
     @Environment(\.dismiss) private var dismiss
 
-    @State private var indexFingerPIPWidthText = ""
+    @State private var thumbLengthText = ""
+    @State private var thumbBaseToIndexTipText = ""
     @State private var showCamera = false
     @State private var capturedReferenceImage: UIImage?
     @State private var isEstimating = false
@@ -1247,8 +1284,16 @@ struct HandCalibrationView: View {
 
     private let estimatorClient = OpenAIMealEstimatorClient()
 
-    private var indexFingerPIPWidthCm: Double? {
-        let normalizedText = indexFingerPIPWidthText.replacingOccurrences(of: ",", with: ".")
+    private var thumbLengthCm: Double? {
+        positiveCentimeterValue(from: thumbLengthText)
+    }
+
+    private var thumbBaseToIndexTipCm: Double? {
+        positiveCentimeterValue(from: thumbBaseToIndexTipText)
+    }
+
+    private func positiveCentimeterValue(from text: String) -> Double? {
+        let normalizedText = text.replacingOccurrences(of: ",", with: ".")
         guard let value = Double(normalizedText), value > 0 else { return nil }
         return value
     }
@@ -1266,10 +1311,13 @@ struct HandCalibrationView: View {
     }
 
     private var handCalibrationImageButtonTitle: LocalizedStringKey {
+        if existingCalibration != nil {
+            return "Redo Hand Calibration"
+        }
         #if targetEnvironment(simulator)
-            "Choose Hand Photo with Credit Card"
+            return "Choose Hand Photo with Credit Card"
         #else
-            "Capture Hand with Credit Card"
+            return "Capture Hand with Credit Card"
         #endif
     }
 
@@ -1286,20 +1334,18 @@ struct HandCalibrationView: View {
             Form {
                 Section {
                     Text(
-                        "Place your first finger on the credit card as shown in the guide. Keep the finger relaxed, flat, and in the same plane as the card."
+                        "Place your left hand flat beside the credit card as shown, with the card to the right of your hand and your thumb extended below the card."
                     )
                     .aiResultWrapped()
                     .font(.footnote)
                     .foregroundStyle(.secondary)
 
-                    if existingCalibration == nil {
-                        Button {
-                            showCamera = true
-                        } label: {
-                            Label(handCalibrationImageButtonTitle, systemImage: handCalibrationImageButtonIcon)
-                        }
-                        .disabled(isEstimating || !handCalibrationImageSourceAvailable)
+                    Button {
+                        showCamera = true
+                    } label: {
+                        Label(handCalibrationImageButtonTitle, systemImage: handCalibrationImageButtonIcon)
                     }
+                    .disabled(isEstimating || !handCalibrationImageSourceAvailable)
 
                     if let capturedReferenceImage {
                         Image(uiImage: capturedReferenceImage)
@@ -1311,13 +1357,18 @@ struct HandCalibrationView: View {
                     if isEstimating {
                         HStack {
                             ProgressView()
-                            Text("Estimating finger width...")
+                            Text("Estimating hand scale...")
                                 .aiResultWrapped()
                         }
                     }
 
-                    if let indexFingerPIPWidthCm {
-                        Text("Index PIP width: \(indexFingerPIPWidthCm, specifier: "%.1f") cm")
+                    if let thumbLengthCm {
+                        Text("Thumb base to thumb tip: \(thumbLengthCm, specifier: "%.1f") cm")
+                            .aiResultWrapped()
+                    }
+
+                    if let thumbBaseToIndexTipCm {
+                        Text("Thumb base to index tip: \(thumbBaseToIndexTipCm, specifier: "%.1f") cm")
                             .aiResultWrapped()
                     }
 
@@ -1350,40 +1401,46 @@ struct HandCalibrationView: View {
 
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        guard let indexFingerPIPWidthCm else { return }
+                        guard let thumbLengthCm, let thumbBaseToIndexTipCm else { return }
                         onSave(
                             HandCalibration(
-                                indexFingerPIPWidthCm: indexFingerPIPWidthCm,
+                                thumbLengthCm: thumbLengthCm,
+                                thumbBaseToIndexTipCm: thumbBaseToIndexTipCm,
                                 calibratedAt: Date(),
                                 calibratedWithCreditCard: capturedReferenceImage != nil
                             )
                         )
                     }
-                    .disabled(indexFingerPIPWidthCm == nil || isEstimating)
+                    .disabled(thumbLengthCm == nil || thumbBaseToIndexTipCm == nil || isEstimating)
                 }
             }
             .sheet(isPresented: $showCamera) {
                 AIMealCameraPicker(
                     sourceType: handCalibrationImageSourceType,
                     cameraOverlayInstruction: String(
-                        localized: "Place your first finger on the credit card as shown in the guide."
+                        localized: "Match hand and card to the guide."
                     )
                 ) { image in
                     capturedReferenceImage = image
                     Task {
-                        await estimateIndexFingerPIPWidth(from: image)
+                        await estimateHandScale(from: image)
                     }
                 }
             }
             .onAppear {
                 if let calibration = existingCalibration ?? HandCalibrationStore.load() {
-                    indexFingerPIPWidthText = String(format: "%.1f", calibration.indexFingerPIPWidthCm)
+                    if let thumbLengthCm = calibration.thumbLengthCm {
+                        thumbLengthText = String(format: "%.1f", thumbLengthCm)
+                    }
+                    if let thumbBaseToIndexTipCm = calibration.thumbBaseToIndexTipCm {
+                        thumbBaseToIndexTipText = String(format: "%.1f", thumbBaseToIndexTipCm)
+                    }
                 }
             }
         }
     }
 
-    private func estimateIndexFingerPIPWidth(from image: UIImage) async {
+    private func estimateHandScale(from image: UIImage) async {
         isEstimating = true
         errorMessage = nil
         confidence = ""
@@ -1395,8 +1452,9 @@ struct HandCalibrationView: View {
                 throw OpenAIMealEstimatorClient.ClientError.missingAPIKey
             }
 
-            let estimate = try await estimatorClient.estimateIndexFingerPIPWidth(from: image, apiKey: trimmedAPIKey)
-            indexFingerPIPWidthText = String(format: "%.1f", estimate.indexFingerPIPWidthCm)
+            let estimate = try await estimatorClient.estimateHandScale(from: image, apiKey: trimmedAPIKey)
+            thumbLengthText = String(format: "%.1f", estimate.thumbLengthCm)
+            thumbBaseToIndexTipText = String(format: "%.1f", estimate.thumbBaseToIndexTipCm)
             confidence = estimate.confidence
             explanation = estimate.explanation
         } catch {
@@ -1408,12 +1466,14 @@ struct HandCalibrationView: View {
 }
 
 struct HandCalibrationEstimate: Decodable {
-    let indexFingerPIPWidthCm: Double
+    let thumbLengthCm: Double
+    let thumbBaseToIndexTipCm: Double
     let confidence: String
     let explanation: String
 
     enum CodingKeys: String, CodingKey {
-        case indexFingerPIPWidthCm = "index_finger_pip_width_cm"
+        case thumbLengthCm = "thumb_length_cm"
+        case thumbBaseToIndexTipCm = "thumb_base_to_index_tip_cm"
         case confidence
         case explanation
     }
@@ -1572,7 +1632,7 @@ struct OpenAIMealEstimatorClient {
         }
     }
 
-    func estimateIndexFingerPIPWidth(from image: UIImage, apiKey: String) async throws -> HandCalibrationEstimate {
+    func estimateHandScale(from image: UIImage, apiKey: String) async throws -> HandCalibrationEstimate {
         guard let imageData = image.jpegData(compressionQuality: 0.72) else {
             throw ClientError.invalidImage
         }
@@ -1586,7 +1646,7 @@ struct OpenAIMealEstimatorClient {
             withJSONObject: requestBody(
                 base64Image: base64Image,
                 prompt: handCalibrationPrompt,
-                schemaName: "hand_index_finger_pip_width_calibration",
+                schemaName: "hand_l_reference_calibration",
                 responseSchema: handCalibrationResponseSchema,
                 imageDetail: "low",
                 reasoningEffort: "low",
@@ -1670,8 +1730,8 @@ struct OpenAIMealEstimatorClient {
         let calibrationText: String
         if let calibration {
             calibrationText = """
-            The user has calibrated their hand scale. Their index-finger PIP width is \(calibration
-                .indexFingerPIPWidthCm) cm. Use the user's visible index finger or hand in the meal photo as a scale reference only when the calibrated finger region is clearly visible.
+            The user has calibrated their hand scale from a credit-card reference. Their calibrated hand references are: \(calibration
+                .primaryScaleDescription). Prefer the thumb-base-to-thumb-tip length or thumb-base-to-index-tip span as scale references in meal photos when the hand is clearly visible, flat, and near the meal. If visible hand references disagree or are partly occluded, lower confidence.
             """
         } else {
             calibrationText = """
@@ -1693,7 +1753,7 @@ struct OpenAIMealEstimatorClient {
 
     private var handCalibrationPrompt: String {
         """
-        Estimate the user's index finger PIP-knuckle width in centimeters from this calibration photo. Use the visible credit card as the scale reference. A standard credit card is 8.56 cm wide and 5.398 cm tall. Measure the width of the index finger across the PIP knuckle. The finger should be relaxed, flat, and directly on top of or immediately adjacent to the credit card, in the same plane. Return high confidence only when the credit card edges are fully visible, the index finger PIP knuckle is clearly identifiable, the finger and card appear flat in the same plane, and perspective distortion is minimal. If the index finger PIP knuckle or credit card edges are not clearly visible, return medium or low confidence and explain that the user should retake the photo with the index finger relaxed, flat, and placed directly on top of or immediately adjacent to the credit card. Return structured JSON only. If either the index finger or the credit card is not visible, set confidence to low and explain what needs to be retaken.
+        Estimate personalized hand scale measurements from this calibration photo. Use the visible credit card as the known scale reference. A standard credit card is 8.56 cm wide and 5.398 cm tall. The user should reproduce the reference pose: left hand flat on the table, palm down, fingers spread, credit card to the right of the hand, and thumb extended horizontally beneath the card. Use the thumb base/web-space region where the thumb separates from the palm as the shared anchor. Estimate thumb_length_cm from the thumb base/web-space anchor to the thumb tip, and thumb_base_to_index_tip_cm from the same thumb base/web-space anchor to the index fingertip. Do not estimate MCP-to-fingertip length or PIP width. Return high confidence only when the card edges and corners are fully visible, the thumb base, thumb tip, and index fingertip are clearly identifiable, the hand and card appear flat in the same plane, and perspective distortion is minimal. If any landmark is uncertain, return medium or low confidence and explain exactly what the user should retake. Return structured JSON only. If either the hand or credit card is not visible, set confidence to low and explain what needs to be retaken.
         """
     }
 
@@ -1823,14 +1883,18 @@ struct OpenAIMealEstimatorClient {
             "type": "object",
             "additionalProperties": false,
             "properties": [
-                "index_finger_pip_width_cm": [
+                "thumb_length_cm": [
                     "type": "number",
-                    "description": "Estimated index finger PIP-knuckle width in centimeters, using the credit card dimensions as scale."
+                    "description": "Estimated distance in centimeters from the thumb base/web-space anchor to the thumb tip, using the credit card dimensions as scale."
+                ],
+                "thumb_base_to_index_tip_cm": [
+                    "type": "number",
+                    "description": "Estimated distance in centimeters from the thumb base/web-space anchor to the index fingertip, using the credit card dimensions as scale."
                 ],
                 "confidence": [
                     "type": "string",
                     "enum": ["low", "medium", "high"],
-                    "description": "Confidence in the index finger PIP width estimate."
+                    "description": "Confidence in the hand scale measurements."
                 ],
                 "explanation": [
                     "type": "string",
@@ -1838,7 +1902,8 @@ struct OpenAIMealEstimatorClient {
                 ]
             ],
             "required": [
-                "index_finger_pip_width_cm",
+                "thumb_length_cm",
+                "thumb_base_to_index_tip_cm",
                 "confidence",
                 "explanation"
             ]
@@ -2081,57 +2146,17 @@ struct AIMealCameraPicker: UIViewControllerRepresentable {
             title.shadowOffset = CGSize(width: 0, height: 1)
             overlay.addSubview(title)
 
-            let cardFrame = CGRect(
-                x: overlay.bounds.width * 0.18,
-                y: overlay.bounds.height * 0.26,
-                width: overlay.bounds.width * 0.64,
-                height: overlay.bounds.width * 0.40
+            let guideImageView = UIImageView(image: UIImage(named: "HandCalibrationOverlay"))
+            guideImageView.frame = CGRect(
+                x: 16,
+                y: 124,
+                width: overlay.bounds.width - 32,
+                height: overlay.bounds.height - 300
             )
-            let cardPath = UIBezierPath(roundedRect: cardFrame, cornerRadius: 18)
-            let cardLayer = CAShapeLayer()
-            cardLayer.path = cardPath.cgPath
-            cardLayer.strokeColor = UIColor.white.cgColor
-            cardLayer.fillColor = UIColor.clear.cgColor
-            cardLayer.lineWidth = 3
-            overlay.layer.addSublayer(cardLayer)
-
-            let fingerFrame = CGRect(
-                x: cardFrame.midX - 42,
-                y: cardFrame.minY + cardFrame.height * 0.16,
-                width: 84,
-                height: cardFrame.height * 1.42
-            )
-            let fingerPath = UIBezierPath(roundedRect: fingerFrame, cornerRadius: 42)
-            let fingerLayer = CAShapeLayer()
-            fingerLayer.path = fingerPath.cgPath
-            fingerLayer.strokeColor = UIColor.white.cgColor
-            fingerLayer.fillColor = UIColor.clear.cgColor
-            fingerLayer.lineWidth = 3
-            overlay.layer.addSublayer(fingerLayer)
-
-            let pipGuideFrame = CGRect(
-                x: fingerFrame.minX - 32,
-                y: fingerFrame.minY + 18,
-                width: fingerFrame.width + 64,
-                height: fingerFrame.width + 64
-            )
-            let pipGuideLayer = CAShapeLayer()
-            pipGuideLayer.path = UIBezierPath(ovalIn: pipGuideFrame).cgPath
-            pipGuideLayer.strokeColor = UIColor.white.withAlphaComponent(0.8).cgColor
-            pipGuideLayer.fillColor = UIColor.clear.cgColor
-            pipGuideLayer.lineWidth = 2
-            pipGuideLayer.lineDashPattern = [8, 8]
-            overlay.layer.addSublayer(pipGuideLayer)
-
-            let centerLine = UIBezierPath()
-            centerLine.move(to: CGPoint(x: cardFrame.midX, y: cardFrame.minY + 20))
-            centerLine.addLine(to: CGPoint(x: cardFrame.midX, y: cardFrame.maxY - 20))
-            let centerLayer = CAShapeLayer()
-            centerLayer.path = centerLine.cgPath
-            centerLayer.strokeColor = UIColor.white.withAlphaComponent(0.55).cgColor
-            centerLayer.lineWidth = 1
-            centerLayer.lineDashPattern = [6, 8]
-            overlay.layer.addSublayer(centerLayer)
+            guideImageView.contentMode = .scaleAspectFit
+            guideImageView.alpha = 0.72
+            guideImageView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            overlay.addSubview(guideImageView)
 
             let footer =
                 UILabel(frame: CGRect(x: 24, y: overlay.bounds.height - 150, width: overlay.bounds.width - 48, height: 56))
