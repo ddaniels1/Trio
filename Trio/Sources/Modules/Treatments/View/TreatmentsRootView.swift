@@ -53,6 +53,8 @@ extension Treatments {
         @State private var showHandCalibration = false
         @State private var showOpenAIAPIKeyField = false
         @State private var aiMealEstimatorViewModel = AIMealEstimatorViewModel()
+        @State private var hungryPercent = 100
+        @State private var fullMealCarbsForHungryPercent: Decimal?
         @State private var autofocus: Bool = true
         @State private var calculatorDetent = PresentationDetent.large
         @State private var pushed: Bool = false
@@ -446,12 +448,41 @@ extension Treatments {
             #endif
         }
 
+        private var hungryPercentSelector: some View {
+            HStack(spacing: 10) {
+                Text("Hungry %")
+                    .font(.footnote)
+                    .fontWeight(.semibold)
+
+                ForEach([25, 50, 75, 100], id: \.self) { percent in
+                    Toggle(isOn: Binding(
+                        get: { hungryPercent == percent },
+                        set: { isSelected in
+                            guard isSelected else { return }
+                            hungryPercent = percent
+                            applyHungryPercentToCarbs()
+                        }
+                    )) {
+                        Text(percent == 50 ? "50" : "\(percent)%")
+                    }
+                    .toggleStyle(RadioButtonToggleStyle())
+                    .font(.footnote)
+                }
+            }
+        }
+
         private func estimateCarbsFromCapturedMeal(_ image: UIImage) async {
             aiMealEstimatorViewModel.setSelectedImage(image)
             await aiMealEstimatorViewModel.estimateCarbs()
 
             guard let carbEstimate = aiMealEstimatorViewModel.carbEstimate else { return }
-            state.carbs = Decimal(carbEstimate.totalCarbsGrams)
+            fullMealCarbsForHungryPercent = Decimal(carbEstimate.totalCarbsGrams)
+            applyHungryPercentToCarbs()
+        }
+
+        private func applyHungryPercentToCarbs() {
+            let fullMealCarbs = fullMealCarbsForHungryPercent ?? state.carbs
+            state.carbs = fullMealCarbs * Decimal(hungryPercent) / Decimal(100)
         }
 
         /// Determines the next field to focus on based on the current focused field.
@@ -626,6 +657,8 @@ extension Treatments {
                                     }
                                 }
                             }
+
+                            hungryPercentSelector
 
                             HStack {
                                 HStack {
