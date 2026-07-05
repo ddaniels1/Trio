@@ -14,6 +14,23 @@ private extension Text {
     }
 }
 
+private extension UIImage {
+    func resizedForAIUpload(maxPixelDimension: CGFloat) -> UIImage {
+        let sourceMaxDimension = max(size.width, size.height)
+        guard sourceMaxDimension > maxPixelDimension, sourceMaxDimension > 0 else { return self }
+
+        let scale = maxPixelDimension / sourceMaxDimension
+        let targetSize = CGSize(width: size.width * scale, height: size.height * scale)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+
+        return UIGraphicsImageRenderer(size: targetSize, format: format).image { _ in
+            draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+    }
+}
+
 extension Treatments {
     struct RootView: BaseView {
         enum FocusedField {
@@ -325,12 +342,18 @@ extension Treatments {
                                 .fontWeight(.semibold)
                             Text("Dimensions: \(foodItem.estimatedDimensions)")
                                 .aiResultWrapped()
-                            Text("Volume: \(foodItem.estimatedVolumeMilliliters) mL")
+                            Text("Volume: \(foodItem.estimatedVolumeCups)")
                                 .aiResultWrapped()
                             Text("Weight: \(foodItem.estimatedWeightGrams) g")
                                 .aiResultWrapped()
-                            Text("Carb density: \(foodItem.assumedCarbsPer100Grams, specifier: "%.1f") g/100 g")
-                                .aiResultWrapped()
+                            Text(
+                                "Carb density: \(foodItem.assumedCarbsPer100Grams, specifier: "%.1f") g/100 g (\(foodItem.carbDensitySourceLabel))"
+                            )
+                            .aiResultWrapped()
+                            if foodItem.carbDensityReferenceName != foodItem.name {
+                                Text("Density matched to: \(foodItem.carbDensityReferenceName)")
+                                    .aiResultWrapped()
+                            }
                             Text("Carbs: \(foodItem.carbsGrams) g")
                                 .aiResultWrapped()
                             Text("Portion confidence: \(foodItem.portionConfidence)")
@@ -1101,7 +1124,7 @@ extension Treatments {
     }
 
     func setSelectedImage(_ image: UIImage) {
-        selectedImage = image
+        selectedImage = image.resizedForAIUpload(maxPixelDimension: 1600)
         carbEstimate = nil
         errorMessage = nil
         #if DEBUG
@@ -1197,11 +1220,12 @@ extension Treatments {
             usageSummary = result.usageSummary
             itemSummary = estimate.foodItems.map { item in
                 String(
-                    format: "%@: %d g carbs, %d g weight, %.1f g/100 g density, %@ portion, %@ density",
+                    format: "%@: %d g carbs, %d g weight, %.1f g/100 g density (%@), %@ portion, %@ density",
                     item.name,
                     item.carbsGrams,
                     item.estimatedWeightGrams,
                     item.assumedCarbsPer100Grams,
+                    item.carbDensitySourceLabel,
                     item.portionConfidence,
                     item.carbDensityConfidence
                 )
@@ -1483,7 +1507,7 @@ struct AIMealCarbEstimate: Decodable {
     struct FoodItem: Decodable, Identifiable {
         let name: String
         let estimatedDimensions: String
-        let estimatedVolumeMilliliters: Int
+        let estimatedVolumeCups: String
         let estimatedWeightGrams: Int
         let assumedCarbsPer100Grams: Double
         let portionConfidence: String
@@ -1491,15 +1515,18 @@ struct AIMealCarbEstimate: Decodable {
         let carbsGrams: Int
         let calculationExplanation: String
         let highFat: Bool
+        let carbDensitySourceLabel: String
+        let carbDensityReferenceName: String
+        let carbDensitySourceDescription: String
 
         var id: String {
-            "\(name)-\(estimatedDimensions)-\(estimatedVolumeMilliliters)-\(estimatedWeightGrams)-\(carbsGrams)"
+            "\(name)-\(estimatedDimensions)-\(estimatedVolumeCups)-\(estimatedWeightGrams)-\(carbsGrams)-\(carbDensitySourceLabel)"
         }
 
         enum CodingKeys: String, CodingKey {
             case name
             case estimatedDimensions = "estimated_dimensions"
-            case estimatedVolumeMilliliters = "estimated_volume_ml"
+            case estimatedVolumeCups = "estimated_volume_cups"
             case estimatedWeightGrams = "estimated_weight_grams"
             case assumedCarbsPer100Grams = "assumed_carbs_per_100g"
             case portionConfidence = "portion_confidence"
@@ -1507,6 +1534,52 @@ struct AIMealCarbEstimate: Decodable {
             case carbsGrams = "carbs_grams"
             case calculationExplanation = "calculation_explanation"
             case highFat = "high_fat"
+        }
+
+        init(
+            name: String,
+            estimatedDimensions: String,
+            estimatedVolumeCups: String,
+            estimatedWeightGrams: Int,
+            assumedCarbsPer100Grams: Double,
+            portionConfidence: String,
+            carbDensityConfidence: String,
+            carbsGrams: Int,
+            calculationExplanation: String,
+            highFat: Bool,
+            carbDensitySourceLabel: String = "AI estimate",
+            carbDensityReferenceName: String? = nil,
+            carbDensitySourceDescription: String = "OpenAI fallback density estimate"
+        ) {
+            self.name = name
+            self.estimatedDimensions = estimatedDimensions
+            self.estimatedVolumeCups = estimatedVolumeCups
+            self.estimatedWeightGrams = estimatedWeightGrams
+            self.assumedCarbsPer100Grams = assumedCarbsPer100Grams
+            self.portionConfidence = portionConfidence
+            self.carbDensityConfidence = carbDensityConfidence
+            self.carbsGrams = carbsGrams
+            self.calculationExplanation = calculationExplanation
+            self.highFat = highFat
+            self.carbDensitySourceLabel = carbDensitySourceLabel
+            self.carbDensityReferenceName = carbDensityReferenceName ?? name
+            self.carbDensitySourceDescription = carbDensitySourceDescription
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.init(
+                name: try container.decode(String.self, forKey: .name),
+                estimatedDimensions: try container.decode(String.self, forKey: .estimatedDimensions),
+                estimatedVolumeCups: try container.decode(String.self, forKey: .estimatedVolumeCups),
+                estimatedWeightGrams: try container.decode(Int.self, forKey: .estimatedWeightGrams),
+                assumedCarbsPer100Grams: try container.decode(Double.self, forKey: .assumedCarbsPer100Grams),
+                portionConfidence: try container.decode(String.self, forKey: .portionConfidence),
+                carbDensityConfidence: try container.decode(String.self, forKey: .carbDensityConfidence),
+                carbsGrams: try container.decode(Int.self, forKey: .carbsGrams),
+                calculationExplanation: try container.decode(String.self, forKey: .calculationExplanation),
+                highFat: try container.decode(Bool.self, forKey: .highFat)
+            )
         }
     }
 
@@ -1517,6 +1590,11 @@ struct AIMealCarbEstimate: Decodable {
         enum CodingKeys: String, CodingKey {
             case lowerBound = "lower_bound"
             case upperBound = "upper_bound"
+        }
+
+        init(lowerBound: Int, upperBound: Int) {
+            self.lowerBound = lowerBound
+            self.upperBound = upperBound
         }
     }
 
@@ -1537,6 +1615,372 @@ struct AIMealCarbEstimate: Decodable {
         case confidence
         case explanation
     }
+
+    init(
+        referenceDetected: Bool,
+        referenceDescription: String,
+        foodItems: [FoodItem],
+        totalCarbsGrams: Int,
+        confidenceIntervalGrams: ConfidenceIntervalGrams,
+        confidence: String,
+        explanation: String
+    ) {
+        self.referenceDetected = referenceDetected
+        self.referenceDescription = referenceDescription
+        self.foodItems = foodItems
+        self.totalCarbsGrams = totalCarbsGrams
+        self.confidenceIntervalGrams = confidenceIntervalGrams
+        self.confidence = confidence
+        self.explanation = explanation
+    }
+}
+
+private struct CarbDensityEntry: Codable, Identifiable {
+    let id: String
+    let displayName: String
+    let aliases: [String]
+    let category: String
+    let carbsPer100Grams: Double
+    let sourceDescription: String
+    let isVerifiedReference: Bool
+    let createdAt: Date
+
+    init(
+        displayName: String,
+        aliases: [String] = [],
+        category: String,
+        carbsPer100Grams: Double,
+        sourceDescription: String = "USDA FoodData Central typical reference value",
+        isVerifiedReference: Bool = true,
+        createdAt: Date = Date(timeIntervalSince1970: 0)
+    ) {
+        id = CarbDensityDatabase.normalized(displayName)
+        self.displayName = displayName
+        self.aliases = aliases
+        self.category = category
+        self.carbsPer100Grams = carbsPer100Grams
+        self.sourceDescription = sourceDescription
+        self.isVerifiedReference = isVerifiedReference
+        self.createdAt = createdAt
+    }
+}
+
+private enum CarbDensityDatabase {
+    private static let learnedEntriesKey = "AIMealEstimator.learnedCarbDensityEntries"
+
+    static func apply(to estimate: AIMealCarbEstimate) -> AIMealCarbEstimate {
+        var learnedEntries = loadLearnedEntries()
+        var didAddLearnedEntry = false
+        let resolvedItems = estimate.foodItems.map { item in
+            resolve(item, learnedEntries: &learnedEntries, didAddLearnedEntry: &didAddLearnedEntry)
+        }
+
+        if didAddLearnedEntry {
+            saveLearnedEntries(learnedEntries)
+        }
+
+        let totalCarbs = resolvedItems.reduce(0) { $0 + $1.carbsGrams }
+        let spread = max(5, Int((Double(totalCarbs) * 0.20).rounded()))
+        let interval = AIMealCarbEstimate.ConfidenceIntervalGrams(
+            lowerBound: max(0, totalCarbs - spread),
+            upperBound: totalCarbs + spread
+        )
+
+        return AIMealCarbEstimate(
+            referenceDetected: estimate.referenceDetected,
+            referenceDescription: estimate.referenceDescription,
+            foodItems: resolvedItems,
+            totalCarbsGrams: totalCarbs,
+            confidenceIntervalGrams: interval,
+            confidence: estimate.confidence,
+            explanation: estimate.explanation
+        )
+    }
+
+    static func normalized(_ value: String) -> String {
+        value
+            .lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    private static func resolve(
+        _ item: AIMealCarbEstimate.FoodItem,
+        learnedEntries: inout [CarbDensityEntry],
+        didAddLearnedEntry: inout Bool
+    ) -> AIMealCarbEstimate.FoodItem {
+        if let verifiedEntry = bestMatch(for: item.name, in: verifiedEntries) {
+            return resolvedItem(from: item, entry: verifiedEntry, sourceLabel: "database value")
+        }
+
+        if let learnedEntry = bestMatch(for: item.name, in: learnedEntries) {
+            return resolvedItem(from: item, entry: learnedEntry, sourceLabel: "saved new food")
+        }
+
+        let newEntry = CarbDensityEntry(
+            displayName: item.name,
+            aliases: [item.name],
+            category: "AI-added food",
+            carbsPer100Grams: item.assumedCarbsPer100Grams,
+            sourceDescription: "OpenAI fallback density estimate saved from prior meal analysis",
+            isVerifiedReference: false,
+            createdAt: Date()
+        )
+        learnedEntries.append(newEntry)
+        didAddLearnedEntry = true
+        return resolvedItem(from: item, entry: newEntry, sourceLabel: "new food")
+    }
+
+    private static func resolvedItem(
+        from item: AIMealCarbEstimate.FoodItem,
+        entry: CarbDensityEntry,
+        sourceLabel: String
+    ) -> AIMealCarbEstimate.FoodItem {
+        let resolvedCarbs = max(0, Int((Double(item.estimatedWeightGrams) * entry.carbsPer100Grams / 100.0).rounded()))
+        let densityText = String(format: "%.1f", entry.carbsPer100Grams)
+        let explanation = "\(item.estimatedWeightGrams) g x \(densityText) g/100 g = \(resolvedCarbs) g."
+
+        return AIMealCarbEstimate.FoodItem(
+            name: item.name,
+            estimatedDimensions: item.estimatedDimensions,
+            estimatedVolumeCups: item.estimatedVolumeCups,
+            estimatedWeightGrams: item.estimatedWeightGrams,
+            assumedCarbsPer100Grams: entry.carbsPer100Grams,
+            portionConfidence: item.portionConfidence,
+            carbDensityConfidence: entry.isVerifiedReference ? "high" : item.carbDensityConfidence,
+            carbsGrams: resolvedCarbs,
+            calculationExplanation: explanation,
+            highFat: item.highFat,
+            carbDensitySourceLabel: sourceLabel,
+            carbDensityReferenceName: entry.displayName,
+            carbDensitySourceDescription: entry.sourceDescription
+        )
+    }
+
+    private static func bestMatch(for foodName: String, in entries: [CarbDensityEntry]) -> CarbDensityEntry? {
+        let normalizedFoodName = normalized(foodName)
+        guard !normalizedFoodName.isEmpty else { return nil }
+
+        var bestEntry: CarbDensityEntry?
+        var bestScore = 0
+
+        for entry in entries {
+            let aliases = ([entry.displayName] + entry.aliases).map(normalized).filter { !$0.isEmpty }
+            for alias in aliases {
+                let score: Int
+                if normalizedFoodName == alias {
+                    score = 1000 + alias.count
+                } else if alias.count >= 4, normalizedFoodName.contains(alias) {
+                    score = 500 + alias.count
+                } else if normalizedFoodName.count >= 4, alias.contains(normalizedFoodName) {
+                    score = 250 + normalizedFoodName.count
+                } else {
+                    score = 0
+                }
+
+                if score > bestScore {
+                    bestScore = score
+                    bestEntry = entry
+                }
+            }
+        }
+
+        return bestEntry
+    }
+
+    private static func loadLearnedEntries() -> [CarbDensityEntry] {
+        guard let data = UserDefaults.standard.data(forKey: learnedEntriesKey) else { return [] }
+        return (try? JSONDecoder().decode([CarbDensityEntry].self, from: data)) ?? []
+    }
+
+    private static func saveLearnedEntries(_ entries: [CarbDensityEntry]) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        UserDefaults.standard.set(data, forKey: learnedEntriesKey)
+    }
+
+    private static let verifiedEntries: [CarbDensityEntry] = [
+        CarbDensityEntry(
+            displayName: "cooked white rice",
+            aliases: ["white rice", "steamed rice", "rice"],
+            category: "grain",
+            carbsPer100Grams: 28.0
+        ),
+        CarbDensityEntry(displayName: "cooked brown rice", aliases: ["brown rice"], category: "grain", carbsPer100Grams: 23.0),
+        CarbDensityEntry(
+            displayName: "cooked jasmine rice",
+            aliases: ["jasmine rice"],
+            category: "grain",
+            carbsPer100Grams: 28.0
+        ),
+        CarbDensityEntry(
+            displayName: "cooked basmati rice",
+            aliases: ["basmati rice"],
+            category: "grain",
+            carbsPer100Grams: 25.0
+        ),
+        CarbDensityEntry(
+            displayName: "fried rice",
+            aliases: ["vegetable fried rice", "chicken fried rice"],
+            category: "grain",
+            carbsPer100Grams: 24.0
+        ),
+        CarbDensityEntry(
+            displayName: "cooked pasta",
+            aliases: ["pasta", "spaghetti", "penne", "noodles"],
+            category: "grain",
+            carbsPer100Grams: 25.0
+        ),
+        CarbDensityEntry(displayName: "cooked macaroni", aliases: ["macaroni"], category: "grain", carbsPer100Grams: 24.0),
+        CarbDensityEntry(
+            displayName: "cooked ramen noodles",
+            aliases: ["ramen", "ramen noodles"],
+            category: "grain",
+            carbsPer100Grams: 27.0
+        ),
+        CarbDensityEntry(displayName: "cooked quinoa", aliases: ["quinoa"], category: "grain", carbsPer100Grams: 21.0),
+        CarbDensityEntry(displayName: "cooked couscous", aliases: ["couscous"], category: "grain", carbsPer100Grams: 23.0),
+        CarbDensityEntry(
+            displayName: "baked potato",
+            aliases: ["potato", "white potato"],
+            category: "starchy vegetable",
+            carbsPer100Grams: 21.0
+        ),
+        CarbDensityEntry(
+            displayName: "mashed potato",
+            aliases: ["mashed potatoes"],
+            category: "starchy vegetable",
+            carbsPer100Grams: 15.0
+        ),
+        CarbDensityEntry(
+            displayName: "french fries",
+            aliases: ["fries", "chips"],
+            category: "starchy vegetable",
+            carbsPer100Grams: 35.0
+        ),
+        CarbDensityEntry(
+            displayName: "baked sweet potato",
+            aliases: ["sweet potato", "yam"],
+            category: "starchy vegetable",
+            carbsPer100Grams: 20.0
+        ),
+        CarbDensityEntry(
+            displayName: "white bread",
+            aliases: ["bread", "toast", "white toast"],
+            category: "bread",
+            carbsPer100Grams: 49.0
+        ),
+        CarbDensityEntry(
+            displayName: "whole wheat bread",
+            aliases: ["wheat bread", "whole grain bread"],
+            category: "bread",
+            carbsPer100Grams: 41.0
+        ),
+        CarbDensityEntry(displayName: "bagel", aliases: ["plain bagel"], category: "bread", carbsPer100Grams: 53.0),
+        CarbDensityEntry(displayName: "flour tortilla", aliases: ["tortilla", "wrap"], category: "bread", carbsPer100Grams: 49.0),
+        CarbDensityEntry(displayName: "corn tortilla", aliases: ["corn tortillas"], category: "bread", carbsPer100Grams: 45.0),
+        CarbDensityEntry(displayName: "pita bread", aliases: ["pita"], category: "bread", carbsPer100Grams: 56.0),
+        CarbDensityEntry(
+            displayName: "cooked oatmeal",
+            aliases: ["oatmeal", "porridge"],
+            category: "breakfast",
+            carbsPer100Grams: 12.0
+        ),
+        CarbDensityEntry(displayName: "pancake", aliases: ["pancakes"], category: "breakfast", carbsPer100Grams: 28.0),
+        CarbDensityEntry(displayName: "waffle", aliases: ["waffles"], category: "breakfast", carbsPer100Grams: 32.0),
+        CarbDensityEntry(
+            displayName: "corn flakes cereal",
+            aliases: ["corn flakes", "breakfast cereal", "cereal"],
+            category: "breakfast",
+            carbsPer100Grams: 84.0
+        ),
+        CarbDensityEntry(displayName: "granola", aliases: ["granola cereal"], category: "breakfast", carbsPer100Grams: 64.0),
+        CarbDensityEntry(displayName: "banana", aliases: ["sliced banana"], category: "fruit", carbsPer100Grams: 23.0),
+        CarbDensityEntry(
+            displayName: "apple",
+            aliases: ["apple slices", "sliced apple"],
+            category: "fruit",
+            carbsPer100Grams: 14.0
+        ),
+        CarbDensityEntry(displayName: "orange", aliases: ["orange segments"], category: "fruit", carbsPer100Grams: 12.0),
+        CarbDensityEntry(
+            displayName: "grapes",
+            aliases: ["green grapes", "red grapes"],
+            category: "fruit",
+            carbsPer100Grams: 18.0
+        ),
+        CarbDensityEntry(
+            displayName: "strawberries",
+            aliases: ["strawberry", "sliced strawberries"],
+            category: "fruit",
+            carbsPer100Grams: 8.0
+        ),
+        CarbDensityEntry(displayName: "blueberries", aliases: ["blueberry"], category: "fruit", carbsPer100Grams: 14.0),
+        CarbDensityEntry(displayName: "pineapple", aliases: ["pineapple chunks"], category: "fruit", carbsPer100Grams: 13.0),
+        CarbDensityEntry(displayName: "watermelon", aliases: ["watermelon cubes"], category: "fruit", carbsPer100Grams: 8.0),
+        CarbDensityEntry(
+            displayName: "cooked carrots",
+            aliases: ["carrots", "carrot"],
+            category: "vegetable",
+            carbsPer100Grams: 8.0
+        ),
+        CarbDensityEntry(displayName: "green peas", aliases: ["peas"], category: "vegetable", carbsPer100Grams: 14.0),
+        CarbDensityEntry(
+            displayName: "sweet corn",
+            aliases: ["corn", "corn kernels"],
+            category: "vegetable",
+            carbsPer100Grams: 19.0
+        ),
+        CarbDensityEntry(displayName: "broccoli", aliases: ["cooked broccoli"], category: "vegetable", carbsPer100Grams: 7.0),
+        CarbDensityEntry(displayName: "black beans", aliases: ["cooked black beans"], category: "legume", carbsPer100Grams: 24.0),
+        CarbDensityEntry(displayName: "pinto beans", aliases: ["cooked pinto beans"], category: "legume", carbsPer100Grams: 27.0),
+        CarbDensityEntry(
+            displayName: "chickpeas",
+            aliases: ["garbanzo beans", "cooked chickpeas"],
+            category: "legume",
+            carbsPer100Grams: 27.0
+        ),
+        CarbDensityEntry(displayName: "lentils", aliases: ["cooked lentils"], category: "legume", carbsPer100Grams: 20.0),
+        CarbDensityEntry(
+            displayName: "plain yogurt",
+            aliases: ["yogurt", "greek yogurt"],
+            category: "dairy",
+            carbsPer100Grams: 5.0
+        ),
+        CarbDensityEntry(displayName: "milk", aliases: ["whole milk", "low fat milk"], category: "dairy", carbsPer100Grams: 5.0),
+        CarbDensityEntry(
+            displayName: "cheese pizza",
+            aliases: ["pizza", "slice of pizza"],
+            category: "mixed dish",
+            carbsPer100Grams: 27.0
+        ),
+        CarbDensityEntry(displayName: "chicken nuggets", aliases: ["nuggets"], category: "mixed dish", carbsPer100Grams: 16.0),
+        CarbDensityEntry(
+            displayName: "breaded chicken",
+            aliases: ["fried chicken", "chicken tenders"],
+            category: "mixed dish",
+            carbsPer100Grams: 15.0
+        ),
+        CarbDensityEntry(
+            displayName: "sushi roll",
+            aliases: ["sushi", "maki roll"],
+            category: "mixed dish",
+            carbsPer100Grams: 29.0
+        ),
+        CarbDensityEntry(displayName: "burrito", aliases: ["bean burrito"], category: "mixed dish", carbsPer100Grams: 25.0),
+        CarbDensityEntry(
+            displayName: "lasagna",
+            aliases: ["meat lasagna", "cheese lasagna"],
+            category: "mixed dish",
+            carbsPer100Grams: 16.0
+        ),
+        CarbDensityEntry(
+            displayName: "macaroni and cheese",
+            aliases: ["mac and cheese", "mac n cheese"],
+            category: "mixed dish",
+            carbsPer100Grams: 20.0
+        )
+    ]
 }
 
 struct OpenAIMealEstimatorClient {
@@ -1583,7 +2027,7 @@ struct OpenAIMealEstimatorClient {
         calibration: HandCalibration?,
         apiKey: String
     ) async throws -> OpenAIMealEstimateResponse {
-        guard let imageData = image.jpegData(compressionQuality: 0.93) else {
+        guard let imageData = preparedJPEGData(from: image, maxPixelDimension: 1600, compressionQuality: 0.88) else {
             throw ClientError.invalidImage
         }
 
@@ -1599,7 +2043,7 @@ struct OpenAIMealEstimatorClient {
                 schemaName: "meal_carb_estimate",
                 responseSchema: mealResponseSchema,
                 imageDetail: "high",
-                reasoningEffort: "low",
+                reasoningEffort: "medium",
                 maxOutputTokens: 4000
             )
         )
@@ -1623,7 +2067,8 @@ struct OpenAIMealEstimatorClient {
 
         do {
             let estimate = try JSONDecoder().decode(AIMealCarbEstimate.self, from: estimateData)
-            return OpenAIMealEstimateResponse(estimate: estimate, usage: responseBody.usage)
+            let resolvedEstimate = CarbDensityDatabase.apply(to: estimate)
+            return OpenAIMealEstimateResponse(estimate: resolvedEstimate, usage: responseBody.usage)
         } catch {
             let preview = String(outputText.prefix(700))
             throw ClientError.requestFailed(
@@ -1633,7 +2078,7 @@ struct OpenAIMealEstimatorClient {
     }
 
     func estimateHandScale(from image: UIImage, apiKey: String) async throws -> HandCalibrationEstimate {
-        guard let imageData = image.jpegData(compressionQuality: 0.72) else {
+        guard let imageData = preparedJPEGData(from: image, maxPixelDimension: 1600, compressionQuality: 0.9) else {
             throw ClientError.invalidImage
         }
 
@@ -1649,7 +2094,7 @@ struct OpenAIMealEstimatorClient {
                 schemaName: "hand_l_reference_calibration",
                 responseSchema: handCalibrationResponseSchema,
                 imageDetail: "low",
-                reasoningEffort: "low",
+                reasoningEffort: "medium",
                 maxOutputTokens: 2000
             )
         )
@@ -1676,6 +2121,17 @@ struct OpenAIMealEstimatorClient {
         } catch {
             throw ClientError
                 .requestFailed("OpenAI returned a calibration result, but it did not match the expected JSON format.")
+        }
+    }
+
+    private func preparedJPEGData(
+        from image: UIImage,
+        maxPixelDimension: CGFloat,
+        compressionQuality: CGFloat
+    ) -> Data? {
+        autoreleasepool {
+            image.resizedForAIUpload(maxPixelDimension: maxPixelDimension)
+                .jpegData(compressionQuality: compressionQuality)
         }
     }
 
@@ -1743,7 +2199,7 @@ struct OpenAIMealEstimatorClient {
         Estimate carbohydrates from the visible meal photo for user confirmation only. Do not provide insulin dosing advice. \(calibrationText)
         Return strict structured JSON only. First identify every visible food item. Do not collapse distinct foods into one item unless they are visually inseparable.
         Detect whether any usable scale reference is visible, including the user's hand based on previous credit-card calibration. Set reference_detected to true only when a visible reference can be used for scale, and describe it in reference_description.
-        For every item, estimate physical dimensions first, then estimate volume in milliliters, then estimate weight in grams. Then select an assumed carbohydrate density in grams of carbohydrate per 100 grams of that food. Calculate carbs_grams from estimated_weight_grams and assumed_carbs_per_100g. Do not choose carbs_grams independently.
+        For every item, estimate physical dimensions first, then estimate volume as a human-readable fraction of a US cup, then estimate weight in grams. Then select an assumed carbohydrate density in grams of carbohydrate per 100 grams only as a fallback for foods not matched by the app local carb-density database. Calculate carbs_grams from estimated_weight_grams and assumed_carbs_per_100g. The app may override the density and carbs_grams after decoding when a local database match exists. Do not choose carbs_grams independently.
         For each item, include portion_confidence for the volume/weight estimate and carb_density_confidence for the carbohydrate density assumption. Keep calculation_explanation under 18 words and briefly state the weight, carb density, and resulting carb calculation.
         Sum the per-item carbs into total_carbs_grams. Do not revise total carbs after summing item carbs. total_carbs_grams must equal the sum of food_items.carbs_grams. Include a required confidence_interval_grams lower_bound and upper_bound for total carbs.
         If no usable hand or scale reference is visible, set reference_detected to false, confidence to low, use a wider confidence interval, and explain that retaking the photo with their hand visible will improve the estimate.
@@ -1772,7 +2228,7 @@ struct OpenAIMealEstimatorClient {
                 ],
                 "food_items": [
                     "type": "array",
-                    "description": "Every visible food item with dimensions, volume, weight, carb density, carbs, confidence details, and high-fat flag.",
+                    "description": "Every visible food item with dimensions, cup-fraction volume, weight, fallback carb density, carbs, confidence details, and high-fat flag.",
                     "items": [
                         "type": "object",
                         "additionalProperties": false,
@@ -1785,9 +2241,9 @@ struct OpenAIMealEstimatorClient {
                                 "type": "string",
                                 "description": "Estimated physical dimensions or portion size of this item."
                             ],
-                            "estimated_volume_ml": [
-                                "type": "integer",
-                                "description": "Estimated volume of this item in milliliters, inferred from visible dimensions and portion shape."
+                            "estimated_volume_cups": [
+                                "type": "string",
+                                "description": "Estimated volume as a human-readable US cup fraction, such as 1/4 cup, 1/2 cup, 3/4 cup, 1 cup, or 1 1/2 cups, inferred from visible dimensions and portion shape."
                             ],
                             "estimated_weight_grams": [
                                 "type": "integer",
@@ -1795,7 +2251,7 @@ struct OpenAIMealEstimatorClient {
                             ],
                             "assumed_carbs_per_100g": [
                                 "type": "number",
-                                "description": "Assumed grams of carbohydrate per 100 grams of this food."
+                                "description": "Fallback assumed grams of carbohydrate per 100 grams of this food. The app may override this with a local carb-density database value."
                             ],
                             "portion_confidence": [
                                 "type": "string",
@@ -1823,7 +2279,7 @@ struct OpenAIMealEstimatorClient {
                         "required": [
                             "name",
                             "estimated_dimensions",
-                            "estimated_volume_ml",
+                            "estimated_volume_cups",
                             "estimated_weight_grams",
                             "assumed_carbs_per_100g",
                             "portion_confidence",
